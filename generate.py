@@ -4,6 +4,10 @@ import torch
 import argparse
 import sys
 from omegaconf import ListConfig
+from dotenv import load_dotenv
+import os
+from pathlib import Path
+from huggingface_hub import hf_hub_download
 
 from hnet.models.mixer_seq import HNetForCausalLM
 from hnet.models.config_hnet import (
@@ -13,6 +17,24 @@ from hnet.models.config_hnet import (
 )
 from hnet.utils.tokenizers import ByteTokenizer
 
+load_dotenv()
+HF_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
+if HF_TOKEN is None:
+    raise ValueError("HF_TOKEN não encontrado no arquivo .env")
+
+
+def download_checkpoint(filename: str) -> str:
+    repo_name = Path(filename).stem
+    checkpoint_dir = Path("checkpoints")
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    return hf_hub_download(
+        repo_id=f"cartesia-ai/{repo_name}",
+        filename=filename,
+        local_dir=checkpoint_dir,
+        token=HF_TOKEN
+    )
 
 def load_from_pretrained(model_path: str, model_config_path: str):
     """Load model from pretrained checkpoint.
@@ -37,6 +59,11 @@ def load_from_pretrained(model_path: str, model_config_path: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = HNetForCausalLM(hnet_cfg, device=device, dtype=torch.bfloat16)
     model.eval()
+
+    # Download checkpoint if it does not exist
+    model_path = download_checkpoint(
+        filename=model_path,
+    )
 
     # Load checkpoint
     major, minor = map(int, torch.__version__.split('.')[:2])

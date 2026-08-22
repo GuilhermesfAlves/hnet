@@ -11,11 +11,11 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = [
-    "torch==2.7",
+    "torch>=2.7",
     "triton>=3.2.0",
-    "mamba_ssm==2.3.0",
-    "flash_attn==2.8.0.post2",
-    "causal_conv1d==1.6.0",
+    "mamba_ssm>=2.3.0",
+    "flash_attn>=2.8.0.post2",
+    "causal_conv1d>=1.6.0",
     "einops",
     "optree",
     "regex",

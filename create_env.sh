@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Cria ambiente
 conda create -n hnet-cuda python=3.10 -y
 conda activate hnet-cuda
