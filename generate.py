@@ -189,6 +189,7 @@ def main():
         print(f"Error loading model: {e}")
         sys.exit(1)
 
+    tokenizer = ByteTokenizer()
 
 
     while True:
@@ -196,9 +197,6 @@ def main():
             prompt = input("\nPrompt: ").strip()
         except EOFError:
             break
-        print(f"[DEBUG] prompt = {prompt!r}", flush=True)
-        if not prompt:
-            continue
 
         print(
             f"\nGenerating (max_tokens={args.max_tokens}, temperature={args.temperature}, top_p={args.top_p})"
@@ -215,12 +213,6 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
         ):
-            print(
-                f"\n[DEBUG] token={token!r}, "
-                f"type={type(token)}, "
-                f"len(buf)={len(buf)}",
-                flush=True,
-            )
             buf.append(token)
             token_count += 1
 
@@ -230,10 +222,6 @@ def main():
                 try:
                     res = tokenizer.decode(buf[:j])
                     decoded = j
-                    print(
-                        f"[DEBUG] decode j={j}: {res!r}",
-                        flush=True,
-                    )
 
                 except Exception as e:
                     print(
@@ -243,10 +231,6 @@ def main():
                 )
 
             if res is not None:
-                    print(
-                        f"[DEBUG] imprimindo: {res!r}",
-                        flush=True,
-                    )
 
                     print(res, end="", flush=True)
                     buf = buf[decoded:]
