@@ -189,7 +189,7 @@ def main():
         print(f"Error loading model: {e}")
         sys.exit(1)
 
-    tokenizer = ByteTokenizer()
+
 
     while True:
         try:
