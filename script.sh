@@ -16,7 +16,7 @@ nvidia-smi --query-gpu=timestamp,index,name,memory.used,memory.total,utilization
 NVIDIA_SMI_PID=$!
 
 
-echo "oi\n" | srun --export=ALL python generate.py \
+printf "hello\nhello world\nhow are you?\n" | srun --export=ALL python generate.py \
 	--model-path hnet_2stage_XL.pt \
 	--config-path ~/hnet/configs/hnet_2stage_XL.json \
 	--max-tokens 1024 \

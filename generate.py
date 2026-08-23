@@ -196,7 +196,7 @@ def main():
             prompt = input("\nPrompt: ").strip()
         except EOFError:
             break
-
+        print(f"[DEBUG] prompt = {prompt!r}", flush=True)
         if not prompt:
             continue
 
@@ -215,21 +215,41 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
         ):
+            print(
+                f"\n[DEBUG] token={token!r}, "
+                f"type={type(token)}, "
+                f"len(buf)={len(buf)}",
+                flush=True,
+            )
             buf.append(token)
             token_count += 1
 
             decoded = None
             res = None
-            for j in range(1, min(len(buf), 4)):
+            for j in range(1, min(len(buf), 4) + 1):
                 try:
                     res = tokenizer.decode(buf[:j])
                     decoded = j
-                except:
-                    pass
+                    print(
+                        f"[DEBUG] decode j={j}: {res!r}",
+                        flush=True,
+                    )
+
+                except Exception as e:
+                    print(
+                    f"[DEBUG] decode j={j} ERROR: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
 
             if res is not None:
-                print(res, end="", flush=True)
-                buf = buf[decoded:]
+                    print(
+                        f"[DEBUG] imprimindo: {res!r}",
+                        flush=True,
+                    )
+
+                    print(res, end="", flush=True)
+                    buf = buf[decoded:]
 
 
 if __name__ == "__main__":
