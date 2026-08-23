@@ -192,7 +192,10 @@ def main():
     tokenizer = ByteTokenizer()
 
     while True:
-        prompt = input("\nPrompt: ").strip()
+        try:
+            prompt = input("\nPrompt: ").strip()
+        except EOFError:
+            break
 
         if not prompt:
             continue
