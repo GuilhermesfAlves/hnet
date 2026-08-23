@@ -15,7 +15,7 @@ from hnet.models.config_hnet import (
     SSMConfig,
     HNetConfig,
 )
-from hnet.utils.tokenizers import ByteTokenizer
+from hnet.utils import ByteTokenizer, print_boundary_tokens
 
 load_dotenv()
 HF_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
@@ -112,6 +112,11 @@ def generate(
     with torch.inference_mode():
         mask = torch.ones(input_ids.shape, device=device, dtype=torch.bool)
         output = model.forward(input_ids, mask=mask, inference_params=inference_cache)
+        print_boundary_tokens(
+            input_ids,
+            output.bpred_output,
+            tokenizer,
+        )
 
     logits = output.logits[0, -1, :] / temperature
 
@@ -146,6 +151,19 @@ def generate(
         # Get logits and apply temperature
         logits = output.logits[0, -1, :] / temperature
 
+
+def decode_buffer(tokenizer, buf):
+    if not buf:
+        return None, 0
+
+    for j in range(1, len(buf) + 1):
+        try:
+            text = tokenizer.decode(buf[:j])
+            return text, j
+        except UnicodeDecodeError:
+            continue
+
+    return None, 0
 
 def main():
     parser = argparse.ArgumentParser(description="Generate text from an H-Net model")
@@ -216,25 +234,11 @@ def main():
             buf.append(token)
             token_count += 1
 
-            decoded = None
-            res = None
-            for j in range(1, min(len(buf), 4) + 1):
-                try:
-                    res = tokenizer.decode(buf[:j])
-                    decoded = j
+            text, decoded = decode_buffer(tokenizer, buf)
 
-                except Exception as e:
-                    print(
-                    f"[DEBUG] decode j={j} ERROR: "
-                    f"{type(e).__name__}: {e}",
-                    flush=True,
-                )
-
-            if res is not None:
-
-                    print(res, end="", flush=True)
-                    buf = buf[decoded:]
-
+            if decoded > 0:
+                print(text, end="", flush=True)
+                buf = buf[decoded:]
 
 if __name__ == "__main__":
     main()
