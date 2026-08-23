@@ -4,12 +4,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-# `flash_attn` (pacote oficial) só roda em GPUs sm_80+ (Ampere ou superior).
-# `flash_attn_compat` mantém a mesma interface, mas usa o `flash_attn` real
-# quando disponível/suportado, e cai para uma implementação em PyTorch puro
-# (via scaled_dot_product_attention) em GPUs mais antigas como sm_60 e sm_70.
-from .flash_attn_compat import (
-    HAS_FLASH_ATTN,
+from flash_attn import (
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
     flash_attn_varlen_kvpacked_func,
@@ -35,10 +30,9 @@ class FlashCausalSelfAttention(nn.Module):
         window_size=(-1, -1),
     ):
         super().__init__()
-        # Antes havia um `assert flash_attn_varlen_qkvpacked_func is not None`
-        # aqui. Isso não é mais necessário: `flash_attn_compat` sempre expõe
-        # uma implementação funcional (real em sm_80+, fallback em PyTorch
-        # puro em GPUs mais antigas como sm_60/sm_70).
+        assert (
+            flash_attn_varlen_qkvpacked_func is not None
+        ), "FlashAttention is not installed"
         self.softmax_scale = softmax_scale
         self.window_size = window_size
 
@@ -97,8 +91,10 @@ class FlashCausalCrossAttention(nn.Module):
         window_size=(-1, -1),
     ):
         super().__init__()
-        # Idem: sem necessidade de assert em `flash_attn_compat`, ver nota
-        # acima em FlashCausalSelfAttention.
+        assert (
+            flash_attn_varlen_kvpacked_func is not None
+        ), "FlashAttention is not installed"
+        assert flash_attn_kvpacked_func is not None, "FlashAttention is not installed"
         self.softmax_scale = softmax_scale
         self.window_size = window_size
 
@@ -220,13 +216,6 @@ class CausalMHA(nn.Module):
         self.softmax_scale = softmax_scale
         self.rotary_emb_dim = rotary_emb_dim
         self.window_size = window_size
-        # Indica se ha um backend de atencao "estilo flash" disponivel para o
-        # caminho rapido de KV-cache (`_update_kvcache_attention`). Com a
-        # camada de compatibilidade isso e sempre verdade: em sm_80+ usamos o
-        # flash_attn real, em sm_60/sm_70 usamos o fallback em PyTorch puro.
-        # `HAS_FLASH_ATTN` (de flash_attn_compat) informa qual dos dois esta
-        # ativo, caso seja util para logging/depuracao.
-        self.use_flash_attn = True
 
         self.num_heads = num_heads
         assert self.d_model % num_heads == 0, "d_model must be divisible by num_heads"

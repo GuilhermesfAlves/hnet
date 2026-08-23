@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from flash_attn.utils.generation import GenerationMixin
+from ..modules.flash_attn_ops_compat import GenerationMixin
 
 from .hnet import HNet, HNetState
 from .config_hnet import HNetConfig

@@ -9,7 +9,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from flash_attn.ops.triton.layer_norm import RMSNorm
+from .flash_attn_ops_compat import RMSNorm
 
 from hnet.modules.block import create_block
 from hnet.modules.utils import get_seq_idx, get_stage_cfg

@@ -5,7 +5,7 @@ from typing import Optional
 
 from torch import nn, Tensor
 
-from flash_attn.ops.triton.layer_norm import RMSNorm
+from .flash_attn_ops_compat import RMSNorm
 from mamba_ssm.modules.mamba2 import Mamba2
 
 from .mha import CausalMHA
