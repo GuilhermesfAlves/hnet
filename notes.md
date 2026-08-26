@@ -1,3 +1,28 @@
+# Anotações
+
+Como as gpus do cluster são antigas, os pacotes de 3ºs foram alterados para compilar com arquitetura `sm_60` e `sm_70`. O pytorch que está sendo utilizado é o 2.10.0 com cuda 12.6 pois é o que suporta essas archs
+
+
+```bash
+#!/bin/bash
+
+# Cria ambiente
+conda create -n hnet2 python=3.10 -y
+conda activate hnet2
+
+# Instala pytorch 2.10.0
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu126
+
+# Instala o cuda-toolkit 12.6
+conda install -c nvidia cuda-toolkit=12.6 -y
+
+# Instala as dependencias do projeto
+pip install -e . --no-build-isolation --no-cache-dir --no-deps
+```
+
+---
+# OLD
+
 # Instala pytorch 2.5.1 e cuda-runtime-torch 12.1
 # pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 \
 #  --index-url https://download.pytorch.org/whl/cu121

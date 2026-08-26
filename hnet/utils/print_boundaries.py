@@ -1,154 +1,198 @@
-# def print_boundary_tokens(input_ids, bpred_output, tokenizer):
-#     input_ids = input_ids.detach().cpu()
-# 
-#     for stage, routing in enumerate(bpred_output):
-#         boundary_mask = routing.boundary_mask.detach().cpu()
-# 
-#         print("\n" + "=" * 60)
-#         print(f"STAGE {stage}")
-#         print("=" * 60)
-# 
-#         for batch_idx in range(input_ids.shape[0]):
-#             ids = input_ids[batch_idx].tolist()
-#             boundaries = boundary_mask[batch_idx].tolist()
-# 
-#             # Remove BOS
-#             if ids and ids[0] == tokenizer.bos_idx:
-#                 ids = ids[1:]
-#                 boundaries = boundaries[1:]
-#                 offset = 1
-#             else:
-#                 offset = 0
-# 
-#             print("\nChunks between boundaries:")
-#             
-#             last_idx = 0
-#             for i, boundary in enumerate(boundaries):
-#                 if not boundary:
-#                     continue
-#                 
-#                 # Pega os tokens entre o último limite e o limite atual
-#                 chunk_ids = ids[last_idx:i]
-#                 
-#                 try:
-#                     chunk_text = tokenizer.decode(chunk_ids)
-#                 except UnicodeDecodeError:
-#                     chunk_text = repr(bytes(chunk_ids))
-#                     
-#                 print(f"[{last_idx + offset:3d} -> {i + offset:3d}]: {chunk_text!r}")
-#                 
-#                 # Atualiza o índice inicial para o próximo chunk
-#                 last_idx = i
-#             
-#             # Imprime o último pedaço da frase (após o último boundary)
-#             if last_idx < len(ids):
-#                 chunk_ids = ids[last_idx:]
-#                 try:
-#                     chunk_text = tokenizer.decode(chunk_ids)
-#                 except UnicodeDecodeError:
-#                     chunk_text = repr(bytes(chunk_ids))
-#                 print(f"[{last_idx + offset:3d} -> {len(ids) + offset:3d}]: {chunk_text!r}")
-# 
-#             print(
-#                 f"\nTokens: {len(ids) + offset}"
-#                 f" | Boundaries: {sum(boundaries)}"
-#             )
 import torch
+
 
 def print_boundary_tokens(input_ids, bpred_output, tokenizer):
     input_ids = input_ids.detach().cpu()
 
-    # Índices dos tokens na sequência original.
-    # Cada estágio vai reduzir esse vetor.
-    original_indices = torch.arange(
-        input_ids.shape[1],
-        dtype=torch.long,
-    )
+    # Cada elemento representa um grupo de tokens originais.
+    # Inicialmente cada token é seu próprio grupo.
+    stage_groups = [
+        [[i] for i in range(input_ids.shape[1])]
+        for _ in range(input_ids.shape[0])
+    ]
+
+    # Guardamos os IDs originais
+    original_ids = [
+        input_ids[b].tolist()
+        for b in range(input_ids.shape[0])
+    ]
 
     for stage, routing in enumerate(bpred_output):
 
         boundary_mask = routing.boundary_mask.detach().cpu()
 
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print(f"STAGE {stage}")
-        print("=" * 60)
+        print("=" * 70)
+
+        new_stage_groups = []
 
         for batch_idx in range(input_ids.shape[0]):
 
-            ids = input_ids[batch_idx].tolist()
             boundaries = boundary_mask[batch_idx].tolist()
+            groups = stage_groups[batch_idx]
 
-            # Índices originais correspondentes aos tokens deste estágio
-            stage_indices = original_indices.tolist()
+            # ---------------------------------------------------------
+            # Remove BOS apenas da visualização
+            # ---------------------------------------------------------
 
-            # Remove BOS somente para exibição
-            if ids and ids[0] == tokenizer.bos_idx:
-                display_ids = ids[1:]
-                display_boundaries = boundaries[1:]
-                display_indices = stage_indices[1:]
-            else:
-                display_ids = ids
-                display_boundaries = boundaries
-                display_indices = stage_indices
+            offset = 1 if (
+                input_ids[batch_idx, 0].item() == tokenizer.bos_idx
+            ) else 0
+
+            display_boundaries = boundaries[offset:]
+            display_groups = groups[offset:]
 
             print("\nChunks between boundaries:")
 
-            last_idx = 0
+            current_group = []
 
-            for i, boundary in enumerate(display_boundaries):
+            for group, boundary in zip(
+                display_groups,
+                display_boundaries,
+            ):
+
+                current_group.extend(group)
 
                 if not boundary:
                     continue
 
-                chunk_ids = display_ids[last_idx:i]
+                # -----------------------------------------------------
+                # IDs dos tokens originais
+                # -----------------------------------------------------
 
-                try:
-                    chunk_text = tokenizer.decode(chunk_ids)
-                except UnicodeDecodeError:
-                    chunk_text = repr(bytes(chunk_ids))
+                chunk_ids = [
+                    original_ids[batch_idx][idx]
+                    for idx in current_group
+                ]
 
-                original_start = display_indices[last_idx]
-                original_end = display_indices[i]
+                # -----------------------------------------------------
+                # Tokens reais do tokenizer
+                # -----------------------------------------------------
+
+                chunk_tokens = tokenizer.convert_ids_to_tokens(
+                    chunk_ids
+                )
+
+                # Texto reconstruído
+                chunk_text = tokenizer.decode(
+                    chunk_ids,
+                    skip_special_tokens=False,
+                )
+
+                original_start = current_group[0]
+                original_end = current_group[-1] + 1
 
                 print(
                     f"[{original_start:3d} -> {original_end:3d}]: "
                     f"{chunk_text!r}"
                 )
 
-                last_idx = i
+                print(
+                    f"    tokens: {chunk_tokens}"
+                )
 
+                print(
+                    f"    ids:    {chunk_ids}"
+                )
+
+                # Esse conjunto será um elemento no próximo estágio
+                new_stage_groups.append(
+                    current_group.copy()
+                )
+
+                current_group = []
+
+            # ---------------------------------------------------------
             # Último chunk
-            if last_idx < len(display_ids):
+            # ---------------------------------------------------------
 
-                chunk_ids = display_ids[last_idx:]
+            if current_group:
 
-                try:
-                    chunk_text = tokenizer.decode(chunk_ids)
-                except UnicodeDecodeError:
-                    chunk_text = repr(bytes(chunk_ids))
+                chunk_ids = [
+                    original_ids[batch_idx][idx]
+                    for idx in current_group
+                ]
 
-                original_start = display_indices[last_idx]
+                chunk_tokens = tokenizer.convert_ids_to_tokens(
+                    chunk_ids
+                )
 
-                if display_indices:
-                    original_end = display_indices[-1] + 1
-                else:
-                    original_end = original_start
+                chunk_text = tokenizer.decode(
+                    chunk_ids,
+                    skip_special_tokens=False,
+                )
+
+                original_start = current_group[0]
+                original_end = current_group[-1] + 1
 
                 print(
                     f"[{original_start:3d} -> {original_end:3d}]: "
                     f"{chunk_text!r}"
+                )
+
+                print(
+                    f"    tokens: {chunk_tokens}"
+                )
+
+                print(
+                    f"    ids:    {chunk_ids}"
+                )
+
+                new_stage_groups.append(
+                    current_group.copy()
                 )
 
             print(
-                f"\nTokens: {len(display_ids)}"
-                f" | Boundaries: {sum(display_boundaries)}"
+                f"\nTokens/chunks neste estágio: "
+                f"{len(display_groups)}"
             )
 
-        # ---------------------------------------------------------
-        # Os tokens selecionados neste estágio são a entrada
-        # para o próximo estágio.
-        # ---------------------------------------------------------
+            print(
+                f"Boundaries: "
+                f"{sum(display_boundaries)}"
+            )
 
-        selected = boundary_mask[0]
+            # ---------------------------------------------------------
+            # IMPORTANTE:
+            # new_stage_groups acima precisa ser separado por batch.
+            # ---------------------------------------------------------
 
-        original_indices = original_indices[selected]
+        # -------------------------------------------------------------
+        # Reconstruir os grupos para cada batch
+        # -------------------------------------------------------------
+
+        next_stage_groups = []
+
+        for batch_idx in range(input_ids.shape[0]):
+
+            boundaries = boundary_mask[batch_idx].tolist()
+            groups = stage_groups[batch_idx]
+
+            offset = 1 if (
+                input_ids[batch_idx, 0].item() == tokenizer.bos_idx
+            ) else 0
+
+            display_boundaries = boundaries[offset:]
+            display_groups = groups[offset:]
+
+            groups_for_next_stage = []
+            current = []
+
+            for group, boundary in zip(
+                display_groups,
+                display_boundaries,
+            ):
+
+                current.extend(group)
+
+                if boundary:
+                    groups_for_next_stage.append(current)
+                    current = []
+
+            if current:
+                groups_for_next_stage.append(current)
+
+            next_stage_groups.append(groups_for_next_stage)
+
+        stage_groups = next_stage_groups
