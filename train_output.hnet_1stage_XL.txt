@@ -1,0 +1,6 @@
+Distribuído: True | world_size=3 | device=cuda:0
+Métricas serão salvas em checkpoints/train_pt/hnet_1stage_XL.metrics.txt
+Construindo modelo...
+Hierarquia com 2 estágio(s) (1 módulo(s) de roteamento)
+Total de parâmetros: 1270.8M
+passo      0 | loss_lm 0.5806 | ppl 1.79 | loss_lb 0.1166 | lr 0.00e+00 | 29.52s/passo | 1,249 tok/s
