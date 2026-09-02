@@ -169,16 +169,20 @@ class ByteConcatDataset(IterableDataset):
 # --------------------------------------------------------------------------- #
 CSV_FIELDS = [
     "step",
-    "split",           # "train" ou "val"
-    "wall_time",        # segundos desde o início do script
+    "split",              # "train" ou "val"
+    "wall_time",          # segundos desde o início do script
     "lm_loss",
     "perplexity",
     "lb_loss",
+    "ratio_loss",         # <-- NOVO: Lratio do paper (eq. 10)
     "total_loss",
+    "bpb",                # <-- NOVO: bits-per-byte
+    "bpic",               # <-- NOVO: bytes-per-innermost-chunk
+    "compression_L1/L0",  # <-- NOVO: ratio do estágio 0 (sempre presente)
+    "compression_L2/L1",  # <-- NOVO: ratio do estágio 1 (vazio se 1-stage)
     "lr",
     "tokens_per_sec",
 ]
-
 
 class CsvLogger:
     """Escreve métricas de treino/validação em CSV, uma linha por evento.
@@ -443,7 +447,7 @@ def main():
         f"recebeu {len(lb_n)}"
     )
 
-    # ---------------- otimizador ----------------
+  # ---------------- otimizador ----------------
     param_groups = group_params(model)
     for g in param_groups:
         g.setdefault("weight_decay", args.weight_decay)
@@ -457,16 +461,58 @@ def main():
         cosine = 0.5 * (1 + math.cos(math.pi * progress))
         return args.min_lr + (args.lr - args.min_lr) * cosine
 
+    # ---------------- helpers de métricas ----------------
+    import math as _math
+
+    def compute_bpb(avg_nll_nats: float, bytes_per_token: float = 1.0) -> float:
+        """BPB = NLL_nats / ln(2) / bytes_per_token"""
+        return avg_nll_nats / _math.log(2) / bytes_per_token
+
+    def compute_compression_ratio(boundary_indicators: torch.Tensor) -> float:
+        """Fração de posições marcadas como boundary — Lˢ⁺¹/Lˢ"""
+        return boundary_indicators.float().mean().item()
+
+    def compute_ratio_loss(
+        boundary_probs: torch.Tensor,
+        boundary_indicators: torch.Tensor,
+        N: float,
+    ) -> torch.Tensor:
+        """Equação 10 do paper: regulariza a taxa de compressão em direção a 1/N"""
+        F_val = boundary_indicators.float().mean()          # não diferenciável
+        G_val = boundary_probs.mean()                       # diferenciável
+        return (N / (N - 1)) * ((N - 1) * F_val * G_val + (1 - F_val) * (1 - G_val))
+
+    def compute_bpic(L0: int, boundary_ind_list: list[torch.Tensor]) -> float:
+        """BPIC = L0 / Lˢ estimado pela composição dos ratios"""
+        compound = 1.0
+        for b in boundary_ind_list:
+            compound *= b.float().mean().item()
+        Ls = L0 * compound
+        return L0 / Ls if Ls > 0 else float("inf")
+
     # ---------------- loop de treino ----------------
     model.train()
     step = 0
     t0 = time.time()
     train_start = t0
-    running_loss = 0.0
-    running_lb_loss = 0.0
-    optimizer.zero_grad()
 
+    # acumuladores — agora incluem as novas métricas
+    running_loss       = 0.0
+    running_lb_loss    = 0.0
+    running_ratio_loss = 0.0                          # <-- NOVO
+    running_bpb        = 0.0                          # <-- NOVO
+    running_bpic       = 0.0                          # <-- NOVO
+    # dicionário para ratios por estágio (quantidade dinâmica de estágios)
+    running_ratios: dict[str, float] = {}             # <-- NOVO
+
+    optimizer.zero_grad()
     data_iter = iter(loader)
+
+    # quantos estágios o modelo tem e qual o N alvo de cada um
+    # ex: [6.0] para 1-stage, [3.0, 3.0] para 2-stage
+    hnet_N_per_stage: list[float] = getattr(args, "hnet_n_per_stage", [])
+    alpha_ratio: float = getattr(args, "load_balancing_weight", 0.03)  # mesmo alpha do paper
+    bytes_per_gpt2_token: float = 4.6   # FineWeb-Edu com GPT-2 tokenizer
 
     while step < args.max_steps:
         for _ in range(args.grad_accum_steps):
@@ -477,27 +523,67 @@ def main():
                 input_ids, targets = next(data_iter)
 
             input_ids = input_ids.to(device)
-            targets = targets.to(device)
+            targets   = targets.to(device)
 
-            # mask=None -> modo "packed" (sem padding), o mais eficiente
-            # para treino com blocos de tamanho fixo.
             output = model(input_ids)
             logits = output.logits
 
+            # ── perda autorregressiva ──────────────────────────────────────────
             lm_loss = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]).float(),
                 targets.reshape(-1),
             )
 
-            lb_loss = torch.zeros((), device=device)
-            for bpred, n in zip(output.bpred_output, lb_n):
-                lb_loss = lb_loss + load_balancing_loss(bpred, n)
+            # ── load-balancing / ratio loss ────────────────────────────────────
+            lb_loss    = torch.zeros((), device=device)
+            ratio_loss = torch.zeros((), device=device)
 
-            loss = lm_loss + args.load_balancing_weight * lb_loss
+            # Caso o modelo exponha boundary_probs e boundary_indicators
+            # (atributos adicionados ao output do H-Net)
+            has_hnet_outputs = (
+                hasattr(output, "boundary_probs_list") and
+                hasattr(output, "boundary_ind_list")
+            )
+
+            if has_hnet_outputs and hnet_N_per_stage:
+                # ── métricas de chunking (H-Net) ───────────────────────────────
+                for s, (b_probs, b_inds, N) in enumerate(
+                    zip(output.boundary_probs_list, output.boundary_ind_list, hnet_N_per_stage)
+                ):
+                    ratio_loss = ratio_loss + compute_ratio_loss(b_probs, b_inds, N)
+
+                # ratio loss substitui / complementa o lb_loss genérico
+                lb_loss = ratio_loss
+
+            else:
+                # fallback: load-balancing original (MoE ou similar)
+                for bpred, n in zip(output.bpred_output, lb_n):
+                    lb_loss = lb_loss + load_balancing_loss(bpred, n)
+
+            loss = lm_loss + alpha_ratio * lb_loss
             (loss / args.grad_accum_steps).backward()
 
-            running_loss += lm_loss.item() / args.grad_accum_steps
-            running_lb_loss += lb_loss.item() / args.grad_accum_steps
+            # ── acumula métricas (sem grad) ────────────────────────────────────
+            with torch.no_grad():
+                running_loss       += lm_loss.item()    / args.grad_accum_steps
+                running_lb_loss    += lb_loss.item()    / args.grad_accum_steps
+                running_ratio_loss += ratio_loss.item() / args.grad_accum_steps
+
+                # BPB do mini-batch atual
+                batch_bpb = compute_bpb(lm_loss.item(), bytes_per_token=1.0)
+                running_bpb += batch_bpb / args.grad_accum_steps
+
+                # Compression ratios e BPIC (só se H-Net)
+                if has_hnet_outputs and hnet_N_per_stage:
+                    L0 = input_ids.shape[1]
+                    running_bpic += (
+                        compute_bpic(L0, output.boundary_ind_list) / args.grad_accum_steps
+                    )
+                    for s, b_ind in enumerate(output.boundary_ind_list):
+                        key = f"L{s+1}/L{s}"
+                        running_ratios[key] = running_ratios.get(key, 0.0) + (
+                            compute_compression_ratio(b_ind) / args.grad_accum_steps
+                        )
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
@@ -509,44 +595,71 @@ def main():
         optimizer.step()
         optimizer.zero_grad()
 
+        # ── log ───────────────────────────────────────────────────────────────
         if step % args.log_every == 0:
             dt = time.time() - t0
-            avg_lm_loss = running_loss / max(1, args.log_every)
-            avg_lb_loss = running_lb_loss / max(1, args.log_every)
-            perplexity = math.exp(min(avg_lm_loss, 20))  # clamp para evitar overflow no início do treino
-            tokens_per_step = args.batch_size * args.seq_len * args.grad_accum_steps
-            tokens_per_sec = (tokens_per_step * args.log_every) / max(dt, 1e-8)
+            n  = max(1, args.log_every)
 
+            avg_lm_loss    = running_loss       / n
+            avg_lb_loss    = running_lb_loss    / n
+            avg_ratio_loss = running_ratio_loss / n
+            avg_bpb        = running_bpb        / n
+            avg_bpic       = running_bpic       / n
+            avg_ratios     = {k: v / n for k, v in running_ratios.items()}
+
+            perplexity       = math.exp(min(avg_lm_loss, 20))
+            tokens_per_step  = args.batch_size * args.seq_len * args.grad_accum_steps
+            tokens_per_sec   = (tokens_per_step * n) / max(dt, 1e-8)
+
+            # linha de log compacta
+            ratio_str = " | ".join(f"{k}={v:.3f}" for k, v in avg_ratios.items())
             print(
                 f"passo {step:6d} | loss_lm {avg_lm_loss:.4f} | ppl {perplexity:.2f} "
-                f"| loss_lb {avg_lb_loss:.4f} "
-                f"| lr {lr:.2e} | {dt / max(1, args.log_every):.2f}s/passo "
-                f"| {tokens_per_sec:,.0f} tok/s"
+                f"| bpb {avg_bpb:.4f} | bpic {avg_bpic:.2f} "
+                f"| ratio_loss {avg_ratio_loss:.4f} | lb_loss {avg_lb_loss:.4f} "
+                + (f"| {ratio_str} " if ratio_str else "")
+                + f"| lr {lr:.2e} | {dt/n:.2f}s/passo | {tokens_per_sec:,.0f} tok/s"
             )
-            csv_logger.log(
+
+            log_kwargs = dict(
                 step=step,
                 split="train",
                 wall_time=round(time.time() - train_start, 2),
                 lm_loss=avg_lm_loss,
                 perplexity=perplexity,
                 lb_loss=avg_lb_loss,
-                total_loss=avg_lm_loss + args.load_balancing_weight * avg_lb_loss,
+                ratio_loss=avg_ratio_loss,          # <-- NOVO
+                total_loss=avg_lm_loss + alpha_ratio * avg_lb_loss,
+                bpb=avg_bpb,                        # <-- NOVO
+                bpic=avg_bpic,                      # <-- NOVO
                 lr=lr,
                 tokens_per_sec=round(tokens_per_sec, 1),
+                **{f"compression_{k}": v for k, v in avg_ratios.items()},  # <-- NOVO
             )
-            running_loss = 0.0
-            running_lb_loss = 0.0
+            csv_logger.log(**log_kwargs)
+
+            # reset acumuladores
+            running_loss       = 0.0
+            running_lb_loss    = 0.0
+            running_ratio_loss = 0.0
+            running_bpb        = 0.0
+            running_bpic       = 0.0
+            running_ratios     = {}
             t0 = time.time()
 
+        # ── validação ─────────────────────────────────────────────────────────
         if val_loader is not None and step > 0 and step % args.eval_every == 0:
             val_lm_loss, val_lb_loss = evaluate(
                 model, lambda: iter(val_loader), lb_n, device, args.eval_steps
             )
-            if val_lm_loss is not None:
+            if val_lm_loss is not None and val_lb_loss is not None:
                 val_ppl = math.exp(min(val_lm_loss, 20))
+                val_bpb = compute_bpb(val_lm_loss, bytes_per_token=1.0)   # <-- NOVO
+
                 print(
                     f"          [val] passo {step:6d} | loss_lm {val_lm_loss:.4f} "
-                    f"| ppl {val_ppl:.2f} | loss_lb {val_lb_loss:.4f}"
+                    f"| ppl {val_ppl:.2f} | bpb {val_bpb:.4f} "  # <-- NOVO
+                    f"| loss_lb {val_lb_loss:.4f}"
                 )
                 csv_logger.log(
                     step=step,
@@ -555,7 +668,10 @@ def main():
                     lm_loss=val_lm_loss,
                     perplexity=val_ppl,
                     lb_loss=val_lb_loss,
-                    total_loss=val_lm_loss + args.load_balancing_weight * val_lb_loss,
+                    ratio_loss="",
+                    total_loss=val_lm_loss + alpha_ratio * val_lb_loss,
+                    bpb=val_bpb,                    # <-- NOVO
+                    bpic="",
                     lr="",
                     tokens_per_sec="",
                 )
