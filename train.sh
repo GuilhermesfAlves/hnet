@@ -5,7 +5,7 @@
 #SBATCH -N 1                   # Número de nós (1 nó)
 #SBATCH -n 1                   # Número de tasks
 #SBATCH -c 8                   # CPUs por task
-#SBATCH --gres=gpu:V100:3      # Número de GPUs (2 GPU)
+#SBATCH --gres=gpu:V100:4      # Número de GPUs (2 GPU)
 #SBATCH --mem=32G              # Memória total
 #SBATCH -o ./output_%j.log     # Arquivo de log (adiciona job id %j)
 #SBATCH -e ./output_%j.err     # Arquivo de erro (adiciona job id %j)
@@ -15,17 +15,27 @@ nvidia-smi --query-gpu=timestamp,index,name,memory.used,memory.total,utilization
     --format=csv -l 1 > gpu_memory_train.log &
 NVIDIA_SMI_PID=$!
 
-hnet_configs=("hnet_1stage_L" "hnet_1stage_XL" "hnet_2stage_L" "hnet_2stage_XL")
+hnet_names=("hnet_1stage_L" "hnet_1stage_XL" "hnet_2stage_L" "hnet_2stage_XL")
+batch_sizes=(12 10 8 8)
+sequence_lengths=(768 768 768 768)
+# learning_rates=(6.25e-4 5e-4 6.25e-4 5e-4)
 
-for hnet in "${hnet_configs[@]}";do
-	srun --export=ALL python -m torch.distributed.run --nproc_per_node=3 train_pt.py \
-        	--dataset-name allenai/c4 \
+for i in "${!hnet_names[@]}";do
+	hnet="${hnet_names[$i]}"
+	batch="${batch_sizes[$i]}"
+	# lr="${learning_rates[$i]}"	
+	seq_len="${sequence_lengths[$i]}"
+
+	echo "$hnet $batch $seq_len"
+	
+	srun --export=ALL python -m torch.distributed.run --nproc_per_node=4 train_pt.py \
+        	--dataset-name uonlp/CulturaX \
 	        --dataset-config-name pt \
 		--csv-path checkpoints/train_pt/$hnet.metrics.txt \
 	        --text-column text \
-		--seq-len 1024 \
-		--batch-size 12 \
-		--streaming \
+		--seq-len $seq_len \
+		--batch-size $batch \
+		--no-streaming \
         	--model-config configs/$hnet.json > train_output.$hnet.txt
 done
 kill $NVIDIA_SMI_PID

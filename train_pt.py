@@ -38,8 +38,8 @@ def setup_distributed():
         rank       = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend="nccl", init_method="env://")
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://", device_id=torch.device(f"cuda:{local_rank}"))
         return rank, world_size, local_rank, True
     return 0, 1, 0, False
 

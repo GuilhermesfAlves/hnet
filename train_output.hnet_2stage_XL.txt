@@ -1,0 +1,5 @@
+Distribuído: True | world_size=4 | device=cuda:0
+Construindo modelo...
+Hierarquia: 3 estágio(s), 2 módulo(s) de roteamento
+Parâmetros: 1603.5M
+Métricas em checkpoints/train_pt/hnet_2stage_XL.metrics.txt
