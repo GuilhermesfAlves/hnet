@@ -293,9 +293,15 @@ def main():
     parser.add_argument("--seed",                      type=int, default=0)
     parser.add_argument("--ddp-find-unused-parameters",action="store_true", default=False)
 
+    # benchmark
+    parser.add_argument("--benchmark", action="store_true", default=False)
+
     args = parser.parse_args()
     if args.dataset_config_name in (None, "None", ""):
         args.dataset_config_name = None
+
+    if args.benchmark:
+        torch.cuda.reset_peak_memory_stats()
 
     # distribuído
     rank, world_size, local_rank, is_distributed = setup_distributed()
@@ -590,6 +596,27 @@ def main():
         print(f"Treino concluído. Checkpoint final em {final}")
         if csv_logger:
             csv_logger.close()
+
+    if args.benchmark:
+        if (is_distributed):
+            print(
+                f"BENCHMARK_RANK={torch.distributed.get_rank()}",
+                flush=True,
+            )
+        torch.cuda.synchronize()
+
+        max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        max_reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
+
+        print(
+            f"BENCHMARK_VRAM_ALLOCATED_MB={max_allocated:.0f}",
+            flush=True,
+        )
+
+        print(
+            f"BENCHMARK_VRAM_RESERVED_MB={max_reserved:.0f}",
+            flush=True,
+        )
 
     if is_distributed:
         dist.barrier()

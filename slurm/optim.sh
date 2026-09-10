@@ -56,27 +56,6 @@ RESULTS="$OUTPUT_DIR/batch_seq_sweep.csv"
 echo "model,seq_len,batch_size,tokens_per_gpu,status,max_vram_mb" \
     > "$RESULTS"
 
-
-# ============================================================
-# Função para obter a maior memória usada pelas GPUs
-# ============================================================
-
-get_max_vram() {
-    nvidia-smi \
-        --query-gpu=memory.used \
-        --format=csv,noheader,nounits \
-        | awk '
-        BEGIN { max=0 }
-        {
-            if ($1 > max)
-                max=$1
-        }
-        END {
-            print max
-        }'
-}
-
-
 # ============================================================
 # Testa uma configuração
 # ============================================================
@@ -113,6 +92,7 @@ test_config() {
         --seq-len "$seq_len" \
         --batch-size "$batch" \
         --max-steps "$BENCHMARK_STEPS" \
+        --benchmark \
         --no-streaming \
         --model-config "configs/$hnet.json" \
         > "$log_file" 2>&1
@@ -124,7 +104,10 @@ test_config() {
     # --------------------------------------------------------
 
     local max_vram
-    max_vram=$(get_max_vram)
+    max_vram=$(grep 'BENCHMARK_VRAM_ALLOCATED_MB=' "$log_file" |
+        sed 's/.*=//' |
+        sort -n |
+        tail -1)
 
     if [ "$exit_code" -ne 0 ]; then
 
@@ -156,10 +139,8 @@ test_config() {
 
     echo "OK"
     echo "VRAM máxima: ${max_vram} MB"
-
     echo "$hnet,$seq_len,$batch,$((batch * seq_len)),OK,$max_vram" \
         >> "$RESULTS"
-
     return 0
 }
 
@@ -169,7 +150,6 @@ test_config() {
 # ============================================================
 
 for hnet in "${hnet_names[@]}"; do
-
     echo
     echo
     echo "############################################################"
@@ -228,23 +208,23 @@ for hnet in "${hnet_names[@]}"; do
             fi
 
         done
-
     done
-
 done
-
 
 # ============================================================
 # Resultado
 # ============================================================
-
 echo
 echo
 echo "############################################################"
 echo "RESULTADOS"
 echo "############################################################"
 
-column -t -s ',' "$RESULTS"
+awk -F',' '{
+    for (i = 1; i <= NF; i++)
+        printf "%-20s", $i
+    print ""
+}' resultado_optim.csv
 
 echo
 echo "Arquivo:"
