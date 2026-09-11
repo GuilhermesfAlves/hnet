@@ -1,113 +1,115 @@
-from datasets import load_dataset
-import numpy as np
-from hnet.utils import ByteTokenizer
-from collections import deque
+import time
+import multiprocessing as mp
+from functools import partial
 
-# ============================================================
-# Configuração
-# ============================================================
+import numpy as np
+from datasets import load_dataset
 
 DATASET_NAME = "uonlp/CulturaX"
 CONFIG_NAME = "pt"
 SPLIT = "train"
 TEXT_COLUMN = "text"
-BATCH_SIZE = 1024  # Processar em batches
+BATCH_SIZE = 4096
+NUM_WORKERS = 16
 
-# ============================================================
-# Carregar tokenizer
-# ============================================================
 
-tokenizer = ByteTokenizer() 
+def process_shard(shard_id, dataset, num_shards, text_column, batch_size):
+    try:
+        shard = dataset.shard(num_shards=num_shards, index=shard_id, contiguous=True)
 
-# ============================================================
-# Carregar dataset (SEM streaming, com cache)
-# ============================================================
+        total_entries = 0
+        total_tokens = 0
+        min_tokens = None
+        max_tokens = None
+        token_counts = []
 
-print("Carregando dataset...")
-dataset = load_dataset(
-    DATASET_NAME,
-    CONFIG_NAME,
-    split=SPLIT,
-    streaming=False,  
-)
+        for start in range(0, len(shard), batch_size):
+            batch = shard[start:start + batch_size]
+            texts = batch[text_column]
+            counts = [len(t.encode("utf-8")) for t in texts if t]
+            if not counts:
+                continue
 
-print(f"Dataset carregado: {len(dataset)} entradas")
+            total_entries += len(counts)
+            total_tokens += sum(counts)
+            mn, mx = min(counts), max(counts)
+            min_tokens = mn if min_tokens is None else min(min_tokens, mn)
+            max_tokens = mx if max_tokens is None else max(max_tokens, mx)
+            token_counts.extend(counts)
 
-# ============================================================
-# Processar em batches com map()
-# ============================================================
+        return {
+            "ok": True,
+            "shard_id": shard_id,
+            "total_entries": total_entries,
+            "total_tokens": total_tokens,
+            "min_tokens": min_tokens,
+            "max_tokens": max_tokens,
+            "token_counts": token_counts,
+        }
+    except Exception as e:
+        # não deixa uma falha de um shard matar o pool inteiro
+        return {"ok": False, "shard_id": shard_id, "error": str(e)}
 
-def tokenize_batch(batch):
-    """Tokeniza um batch de textos"""
-    texts = batch[TEXT_COLUMN]
-    
-    # Filtrar textos vazios
-    filtered_texts = [t for t in texts if t]
-    
-    if not filtered_texts:
-        return {"token_counts": []}
-    
-    # Tokenizar em batch (mais eficiente)
-    token_counts = [len(tokenizer.encode(text)) for text in filtered_texts]
-    
-    return {"token_counts": token_counts}
 
-print("Tokenizando dataset...")
-dataset_tokens = dataset.map(
-    tokenize_batch,
-    batched=True,
-    batch_size=BATCH_SIZE,
-    remove_columns=[TEXT_COLUMN],  
-    num_proc=8,
-    desc="Tokenizando",
-)
+def main():
+    t0 = time.time()
 
-# ============================================================
-# Extrai contagens e filtra vazios
-# ============================================================
+    print("Carregando dataset (uma única vez, no processo pai)...")
+    dataset = load_dataset(DATASET_NAME, CONFIG_NAME, split=SPLIT, streaming=False)
+    print(f"Dataset carregado: {len(dataset):,} entradas")
 
-all_token_counts = []
-total_entries = 0
-total_tokens = 0
+    print(f"Disparando {NUM_WORKERS} workers via fork...")
+    worker_fn = partial(
+        process_shard,
+        dataset=dataset,          # herdado via fork, sem recarregar
+        num_shards=NUM_WORKERS,
+        text_column=TEXT_COLUMN,
+        batch_size=BATCH_SIZE,
+    )
 
-for item in dataset_tokens:
-    counts = item["token_counts"]
-    if counts:  # Pula se vazio
-        all_token_counts.extend(counts)
-        total_entries += len(counts)
-        total_tokens += sum(counts)
-    
-    if total_entries % 500_000 == 0:
-        print(
-            f"Processados: {total_entries:,} | "
-            f"Tokens: {total_tokens:,} | "
-            f"Média: {total_tokens / total_entries:,.2f}"
-        )
+    ctx = mp.get_context("fork")
+    with ctx.Pool(processes=NUM_WORKERS) as pool:
+        results = []
+        for i, r in enumerate(pool.imap_unordered(worker_fn, range(NUM_WORKERS)), 1):
+            if not r["ok"]:
+                print(f"[{i}/{NUM_WORKERS}] Shard {r['shard_id']} FALHOU: {r['error']}")
+                continue
+            print(f"[{i}/{NUM_WORKERS}] Shard {r['shard_id']} OK: "
+                  f"{r['total_entries']:,} entradas | {r['total_tokens']:,} tokens")
+            results.append(r)
 
-# ============================================================
-# Estatísticas (com numpy array)
-# ============================================================
+    if not results:
+        print("Nenhum shard processado com sucesso. Abortando.")
+        return
 
-lengths = np.array(all_token_counts)
+    total_entries = sum(r["total_entries"] for r in results)
+    total_tokens = sum(r["total_tokens"] for r in results)
+    min_tokens = min(r["min_tokens"] for r in results if r["min_tokens"] is not None)
+    max_tokens = max(r["max_tokens"] for r in results if r["max_tokens"] is not None)
 
-mean_tokens = total_tokens / total_entries
+    all_token_counts = []
+    for r in results:
+        all_token_counts.extend(r["token_counts"])
 
-print("\n" + "=" * 60)
-print("RESULTADO")
-print("=" * 60)
+    lengths = np.asarray(all_token_counts)
+    elapsed = time.time() - t0
 
-print(f"Dataset:              {DATASET_NAME}")
-print(f"Config:               {CONFIG_NAME}")
-print(f"Split:                {SPLIT}")
-print(f"Entradas:             {total_entries:,}")
-print(f"Tokens totais:        {total_tokens:,}")
-print(f"Média tokens/entrada: {mean_tokens:,.2f}")
-print(f"Mínimo:               {int(np.min(lengths)):,}")
-print(f"Máximo:               {int(np.max(lengths)):,}")
+    print("\n" + "=" * 60)
+    print("RESULTADO")
+    print("=" * 60)
+    print(f"Workers OK:           {len(results)}/{NUM_WORKERS}")
+    print(f"Tempo total:          {elapsed:,.1f}s")
+    print(f"Entradas:             {total_entries:,}")
+    print(f"Tokens totais:        {total_tokens:,}")
+    print(f"Média tokens/entrada: {total_tokens / total_entries:,.2f}")
+    print(f"Mínimo:               {min_tokens:,}")
+    print(f"Máximo:               {max_tokens:,}")
+    print(f"Mediana (P50):        {np.percentile(lengths, 50):,.2f}")
+    print(f"P90:                  {np.percentile(lengths, 90):,.2f}")
+    print(f"P95:                  {np.percentile(lengths, 95):,.2f}")
+    print(f"P99:                  {np.percentile(lengths, 99):,.2f}")
+    print("=" * 60)
 
-print(f"Mediana (P50):        {np.percentile(lengths, 50):,.2f}")
-print(f"P90:                  {np.percentile(lengths, 90):,.2f}")
-print(f"P95:                  {np.percentile(lengths, 95):,.2f}")
-print(f"P99:                  {np.percentile(lengths, 99):,.2f}")
 
-print("=" * 60)
+if __name__ == "__main__":
+    main()
