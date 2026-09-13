@@ -1,10 +1,9 @@
 from dataclasses import dataclass, field
-from typing import List, Union
+from typing import Dict, List, Union
 
 
 @dataclass
 class AttnConfig:
-
     num_heads: List = field(default_factory=list)
     rotary_emb_dim: List = field(default_factory=list)
     window_size: List = field(default_factory=list)
@@ -18,6 +17,10 @@ class SSMConfig:
     d_state: int = 128
     chunk_size: int = 256
 
+@dataclass
+class ExternalBackboneConfig:
+    hf_model: str
+    frozen: bool = True
 
 @dataclass
 class HNetConfig:
@@ -29,3 +32,4 @@ class HNetConfig:
     ssm_cfg: SSMConfig = field(default_factory=SSMConfig)
     attn_cfg: AttnConfig = field(default_factory=AttnConfig)
     tie_embeddings: bool = False
+    external_backbones: Dict[str, ExternalBackboneConfig] = field(default_factory=dict)

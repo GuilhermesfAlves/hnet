@@ -16,6 +16,7 @@ class CsvLogger:
     def _make_csv_fields(self, n_stages: int = 1) -> list:
         base = [
             "step",
+            "tokens",
             "split",
             "wall_time",
             "lm_loss",

@@ -1,249 +1,51 @@
 """
 train_pt.py  —  H-Net · treinamento em português (ou qualquer corpus HF)
+
+Suporta dois tipos de núcleo (rede central), escolhidos automaticamente pelo
+`arch_layout` do --model-config:
+
+  1) Núcleo nativo H-Net (ex.: "T22", "T26"):
+     ["m4", ["T22"], "m4"]
+     ["m4", ["T1m4", ["T26"], "m4T1"], "m4"]
+     -> treina a hierarquia inteira normalmente (comportamento original).
+
+  2) Núcleo Llama 3.2 3B (spec "Llama"):
+     ["m4", ["Llama"], "m4"]
+     ["m4", ["T1m4", ["Llama"], "m4T1"], "m4"]
+     -> carrega os pesos de um Llama 3.2 3B pré-treinado (HF) dentro do
+        submódulo indicado por --llama-attr-path, congela esse submódulo
+        (requires_grad=False) e treina só as redes externas (m4 / T1m4,
+        i.e. o "tokenizador" do H-Net).
 """
 
 import argparse
 import math
-import json
 import os
 import time
 from pathlib import Path
-from typing import Iterator, Optional
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import DataLoader
 from dotenv import load_dotenv
 
-from datasets import load_dataset
-
-from hnet.models.config_hnet import AttnConfig, SSMConfig, HNetConfig
-from hnet.models.mixer_seq import HNetForCausalLM
 from hnet.utils.train import load_balancing_loss, group_params
-from hnet.utils import ByteTokenizer
 from hnet.utils.csv_logger import CsvLogger
+from hnet.utils.arch import count_boundary_stages
 from hnet.utils.metrics import (
     HNetMetrics,
     compute_bpic,
     compute_compression_ratio,
     compute_ratio_loss,
 )
-
+from hnet.models.mixer_seq import build_model, find_frozen_external_modules
+from train.evaluate import evaluate
+from hnet.utils.datasets import ByteConcatDataset, collate_fn
+from hnet.utils.distributed import setup_distributed
 load_dotenv()
 HF_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
-
-
-# --------------------------------------------------------------------------- #
-# Distribuído
-# --------------------------------------------------------------------------- #
-def setup_distributed():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank       = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://", device_id=torch.device(f"cuda:{local_rank}"))
-        return rank, world_size, local_rank, True
-    return 0, 1, 0, False
-
-
-# --------------------------------------------------------------------------- #
-# Dataset
-# --------------------------------------------------------------------------- #
-class ByteConcatDataset(IterableDataset):
-    def __init__(
-        self,
-        dataset_name: str,
-        dataset_config_name: Optional[str],
-        split: str,
-        text_column: str,
-        seq_len: int,
-        streaming: bool = True,
-        shuffle_buffer_size: int = 10_000,
-        seed: int = 0,
-        hf_token: Optional[str] = None,
-        add_doc_boundaries: bool = True,
-        trust_remote_code: bool = False,
-        rank: int = 0,
-        world_size: int = 1,
-    ):
-        super().__init__()
-        self.dataset_name        = dataset_name
-        self.dataset_config_name = dataset_config_name
-        self.split               = split
-        self.text_column         = text_column
-        self.seq_len             = seq_len
-        self.streaming           = streaming
-        self.shuffle_buffer_size = shuffle_buffer_size
-        self.seed                = seed
-        self.hf_token            = hf_token
-        self.add_doc_boundaries  = add_doc_boundaries
-        self.trust_remote_code   = trust_remote_code
-        self.rank                = rank
-        self.world_size          = world_size
-        self.tokenizer           = ByteTokenizer()
-
-    def _load_hf_dataset(self):
-        kwargs = {}
-        if self.hf_token:
-            kwargs["token"] = self.hf_token
-        if self.trust_remote_code:
-            kwargs["trust_remote_code"] = True
-        ds = load_dataset(
-            self.dataset_name,
-            self.dataset_config_name,
-            split=self.split,
-            streaming=self.streaming,
-            **kwargs,
-        )
-        if self.streaming:
-            ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
-        else:
-            ds = ds.shuffle(seed=self.seed)
-        if self.world_size > 1:
-            ds = ds.shard(num_shards=self.world_size, index=self.rank)
-        return ds
-
-    def __iter__(self) -> Iterator[np.ndarray]:
-        worker_info = torch.utils.data.get_worker_info()
-        ds = self._load_hf_dataset()
-        if worker_info is not None:
-            ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
-
-        buffer    = np.empty(0, dtype=np.uint8)
-        block_len = self.seq_len + 1
-
-        for example in ds:
-            text = example.get(self.text_column) if isinstance(example, dict) else None
-            if not text:
-                continue
-            encoded = self.tokenizer.encode(
-                [text],
-                add_bos=self.add_doc_boundaries,
-                add_eos=self.add_doc_boundaries,
-            )[0]["input_ids"]
-            buffer = np.concatenate([buffer, encoded])
-            while len(buffer) >= block_len:
-                chunk  = buffer[:block_len]
-                buffer = buffer[block_len:]
-                yield chunk
-
-
-def collate_fn(batch):
-    batch     = np.stack(batch, axis=0)
-    batch     = torch.from_numpy(batch.astype(np.int64))
-    input_ids = batch[:, :-1].contiguous()
-    targets   = batch[:, 1:].contiguous()
-    return input_ids, targets
-
-
-# --------------------------------------------------------------------------- #
-# Modelo
-# --------------------------------------------------------------------------- #
-def build_model(model_config_path: str, device: str, dtype: torch.dtype):
-    with open(model_config_path) as f:
-        config = json.load(f)
-    attn_cfg = AttnConfig(**config.pop("attn_cfg"))
-    ssm_cfg  = SSMConfig(**config.pop("ssm_cfg"))
-    hnet_cfg = HNetConfig(**config, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg)
-    model    = HNetForCausalLM(hnet_cfg, device=device, dtype=dtype)
-    model.init_weights()
-    return model, hnet_cfg
-
-
-def count_boundary_stages(arch_layout) -> int:
-    n      = 0
-    layout = arch_layout
-    while isinstance(layout, list) and len(layout) == 3:
-        n     += 1
-        layout = layout[1]
-    return n
-
-
-@torch.no_grad()
-def evaluate(model, val_iter_factory, lb_n: list, device, eval_steps: int, bytes_per_token: float = 1.0):
-    """
-    Validação usando HNetMetrics para acumular:
-      - soma exata de NLL/tokens  -> lm_loss e BPB exatos sobre todo o split
-      - médias por batch          -> lb_loss, ratio_loss, bpic, stage_ratios
-
-    Retorna: (lm_loss, lb_loss, ratio_loss, bpb, bpic, stage_ratios)
-    """
-    model.eval()
-    data_iter   = val_iter_factory()
-    val_metrics = HNetMetrics()
-
-    for _ in range(eval_steps):
-        try:
-            input_ids, targets = next(data_iter)
-        except StopIteration:
-            break
-
-        input_ids = input_ids.to(device)
-        targets   = targets.to(device)
-        B, L0     = input_ids.shape
-
-        output = model(input_ids)
-        logits = output.logits
-
-        # NLL exata (reduction="sum") -> soma-se ao total para BPB exato
-        nll_sum = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(),
-            targets.reshape(-1),
-            reduction="sum",
-        )
-
-        lb_loss = torch.zeros((), device=device)
-        if hasattr(output, "bpred_output") and lb_n:
-            for bpred, n in zip(output.bpred_output, lb_n):
-                lb_loss = lb_loss + load_balancing_loss(bpred, n)
-
-        ratio_loss   = torch.zeros((), device=device)
-        stage_ratios = {}
-        bpic         = 0.0
-        has_hnet = (
-            hasattr(output, "boundary_probs_list") and
-            hasattr(output, "boundary_ind_list")
-        )
-
-        if has_hnet and lb_n:
-            for b_probs, b_inds, N in zip(
-                output.boundary_probs_list, output.boundary_ind_list, lb_n
-            ):
-                ratio_loss = ratio_loss + compute_ratio_loss(b_probs, b_inds, N)
-
-            for s, b_ind in enumerate(output.boundary_ind_list):
-                key = f"compression_L{s+1}/L{s}"
-                stage_ratios[key] = compute_compression_ratio(b_ind)
-
-            bpic = compute_bpic(L0, output.boundary_ind_list)
-
-        val_metrics.update(
-            nll_sum_nats=nll_sum.item(),
-            n_tokens=B * L0,
-            lb_loss=lb_loss.item(),
-            ratio_loss=ratio_loss.item(),
-            bpic=bpic,
-            stage_ratios=stage_ratios,
-        )
-
-    model.train()
-
-    avgs = val_metrics.averages(bytes_per_token=bytes_per_token)
-    if not avgs:
-        return None, None, None, None, None, {}
-
-    return (
-        avgs["lm_loss"],
-        avgs["lb_loss"],
-        avgs["ratio_loss"],
-        avgs["bpb"],
-        avgs["bpic"],
-        avgs["stage_ratios"],
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -270,7 +72,8 @@ def main():
     parser.add_argument("--seq-len",              type=int,   default=4096)
     parser.add_argument("--batch-size",           type=int,   default=8)
     parser.add_argument("--grad-accum-steps",     type=int,   default=1)
-    parser.add_argument("--max-steps",            type=int,   default=100_000)
+    parser.add_argument("--max-steps",            type=int,   default=None)
+    parser.add_argument("--max-tokens",           type=int,   default=None)
     parser.add_argument("--warmup-steps",         type=int,   default=1000)
     parser.add_argument("--lr",                   type=float, default=3e-4)
     parser.add_argument("--min-lr",               type=float, default=3e-5)
@@ -299,6 +102,13 @@ def main():
     args = parser.parse_args()
     if args.dataset_config_name in (None, "None", ""):
         args.dataset_config_name = None
+
+    if args.max_steps is None and args.max_tokens is None:
+        args.max_steps = 100_000  # default se nenhum for passado
+    elif args.max_steps is not None and args.max_tokens is not None:
+        raise ValueError("Passe apenas --max-steps OU --max-tokens, não ambos")
+
+    use_token_limit = args.max_tokens is not None
 
     if args.benchmark:
         torch.cuda.reset_peak_memory_stats()
@@ -365,14 +175,25 @@ def main():
     if is_main:
         print(f"Hierarquia: {n_total_stages} estágio(s), {n_boundary_stages} módulo(s) de roteamento")
 
+    start_step = 0
     if args.resume_from:
         if is_main:
             print(f"Retomando de {args.resume_from}")
-        model.load_state_dict(torch.load(args.resume_from, map_location=device))
+        ckpt = torch.load(args.resume_from, map_location=device)
+        # Na retomada:
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            # missing = pesos do Llama que estão em memória mas não em disco (esperado)
+            # unexpected = vazio
+            start_step = ckpt.get("step", 0)
+            total_tokens = ckpt.get("total_tokens", 0)
+        if is_main:
+            print(f"Retomando a partir do passo {start_step}")
 
     if is_main:
-        n_params = sum(p.numel() for p in model.parameters())
-        print(f"Parâmetros: {n_params/1e6:.1f}M")
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_frozen    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        print(f"Parâmetros treináveis: {n_trainable/1e6:.1f}M | congelados: {n_frozen/1e6:.1f}M")
 
     # lr multipliers
     lr_mult = (
@@ -398,10 +219,12 @@ def main():
         csv_logger = CsvLogger(csv_path, n_stages=n_boundary_stages)
         print(f"Métricas em {csv_path}")
 
-    # otimizador
+    # otimizador — parâmetros congelados (núcleo Llama) ficam fora dos grupos
     param_groups = group_params(model)
     for g in param_groups:
+        g["params"] = [p for p in g["params"] if p.requires_grad]
         g.setdefault("weight_decay", args.weight_decay)
+    param_groups = [g for g in param_groups if len(g["params"]) > 0]
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
 
     raw_model = model
@@ -412,13 +235,25 @@ def main():
     def lr_at(step):
         if step < args.warmup_steps:
             return args.lr * step / max(1, args.warmup_steps)
-        progress = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
-        cosine   = 0.5 * (1 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+        # Progress ainda é baseado em steps, não tokens
+        # (se quiser variar por tokens, seria mais complexo)
+        max_steps_for_schedule = args.max_steps or 100_000
+        progress = (step - args.warmup_steps) / max(1, max_steps_for_schedule - args.warmup_steps)
+        cosine = 0.5 * (1 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
         return args.min_lr + (args.lr - args.min_lr) * cosine
 
     # ── acumuladores ────────────────────────────────────────────────────────
+    # Detectar módulos congelados que já vêm do config
+    frozen_modules = find_frozen_external_modules(model)
+    if frozen_modules and is_main:
+        print(f"{len(frozen_modules)} backbone(s) externo(s) pré-treinado(s) e congelado(s).")
+
     model.train()
-    step             = 0
+    for m in frozen_modules:
+        m.eval()
+
+    step             = start_step
+    total_tokens     = 0
     t0               = time.time()
     train_start      = t0
     steps_since_log  = 0
@@ -429,7 +264,15 @@ def main():
     data_iter = iter(loader)
 
     # ── loop principal ───────────────────────────────────────────────────────
-    while step < args.max_steps:
+    while True:
+        # Condição de parada: max_steps ou max_tokens
+        if use_token_limit:
+            if total_tokens >= args.max_tokens:
+                break
+        else:
+            if step >= args.max_steps:
+                break
+
         for _ in range(args.grad_accum_steps):
             try:
                 input_ids, targets = next(data_iter)
@@ -440,6 +283,9 @@ def main():
             input_ids = input_ids.to(device)
             targets   = targets.to(device)
             B, L0     = input_ids.shape
+
+            tokens_this_batch = B * L0
+            total_tokens += tokens_this_batch
 
             output = model(input_ids)
             logits = output.logits
@@ -524,7 +370,7 @@ def main():
 
                     ratio_str = " | ".join(f"{k}={v:.3f}" for k, v in avg_ratios.items())
                     print(
-                        f"passo {step:6d} | lm {avg_lm:.4f} | ppl {perplexity:.2f}"
+                        f"passo {step:6d} | tokens {total_tokens:6d} | lm {avg_lm:.4f} | ppl {perplexity:.2f}"
                         f" | bpb {avg_bpb:.4f} | bpic {avg_bpic:.2f}"
                         f" | ratio_loss {avg_ratio:.4f} | lb {avg_lb:.4f}"
                         + (f" | {ratio_str}" if ratio_str else "")
@@ -544,6 +390,7 @@ def main():
                             bpic=avg_bpic,
                             lr=lr,
                             tokens_per_sec=round(tok_per_sec, 1),
+                            tokens=total_tokens,
                             **avg_ratios,
                         )
 
@@ -554,16 +401,14 @@ def main():
 
         # ── validação ────────────────────────────────────────────────────────
         if is_main and val_loader and step > 0 and step % args.eval_every == 0:
-            result = evaluate(
-                raw_model, lambda: iter(val_loader), lb_n, device, args.eval_steps
-            )
+            result = evaluate(raw_model, lambda: iter(val_loader), lb_n, device, args.eval_steps)
             val_lm, val_lb, val_ratio, val_bpb, val_bpic, val_stage_ratios = result
 
             if val_lm is not None:
                 val_ppl = math.exp(min(val_lm, 20))
                 ratio_str = " | ".join(f"{k}={v:.3f}" for k, v in val_stage_ratios.items())
                 print(
-                    f"          [val] passo {step:6d}"
+                    f"          [val] passo {step:6d} | tokens {total_tokens:6d}"
                     f" | lm {val_lm:.4f} | ppl {val_ppl:.2f}"
                     f" | bpb {val_bpb:.4f} | bpic {val_bpic:.2f}"
                     f" | ratio_loss {val_ratio:.4f}"
@@ -576,23 +421,36 @@ def main():
                         wall_time=round(time.time() - train_start, 2),
                         lm_loss=val_lm,
                         perplexity=val_ppl,
-                    lb_loss=val_lb,
-                    ratio_loss=val_ratio,
-                    total_loss=val_lm + args.load_balancing_weight * val_lb,
-                    bpb=val_bpb,
-                    bpic=val_bpic,
-                    **val_stage_ratios,
-                )
+                        lb_loss=val_lb,
+                        ratio_loss=val_ratio,
+                        total_loss=val_lm + args.load_balancing_weight * val_lb,
+                        bpb=val_bpb,
+                        bpic=val_bpic,
+                        tokens=total_tokens,
+                        **val_stage_ratios,
+                    )
 
         # ── checkpoint ───────────────────────────────────────────────────────
         if is_main and step > 0 and step % args.save_every == 0:
-            ckpt = Path(args.out_dir) / f"step_{step}.pt"
-            torch.save(raw_model.state_dict(), ckpt)
-            print(f"Checkpoint salvo em {ckpt}")
+            ckpt_path  = Path(args.out_dir) / f"step_{step}.pt"
+            # No checkpoint:
+            torch.save(
+                {
+                    "model_state_dict": raw_model.state_dict(),
+                    "step": step,
+                    "total_tokens": total_tokens,
+                },
+                ckpt_path,
+            )
+            print(f"Checkpoint salvo em {ckpt_path}")
 
     if is_main:
         final = Path(args.out_dir) / "final.pt"
-        torch.save(raw_model.state_dict(), final)
+        torch.save({
+            "model_state_dict": raw_model.state_dict(),
+            "step": step,
+            "total_tokens": total_tokens,
+        }, final)
         print(f"Treino concluído. Checkpoint final em {final}")
         if csv_logger:
             csv_logger.close()

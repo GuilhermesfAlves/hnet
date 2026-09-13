@@ -121,13 +121,16 @@ class HNet(nn.Module):
     def _init_weights(self, initializer_range: float = 0.02, parent_residuals: int = 0) -> None:
         n_residuals = parent_residuals
         if self.is_innermost:
-            n_residuals += self.main_network.height
-            for name, m in self.main_network.named_modules():
-                if isinstance(m, nn.Linear) and not getattr(m.weight, "_no_reinit", False):
-                    if "out_proj" in name or "fc2" in name:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
-                    else:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
+            if getattr(self.main_network, "is_external", False):
+                pass  # backbone externo pré-treinado (ex. Llama) — nunca reinicializar
+            else:
+                n_residuals += self.main_network.height
+                for name, m in self.main_network.named_modules():
+                    if isinstance(m, nn.Linear) and not getattr(m.weight, "_no_reinit", False):
+                        if "out_proj" in name or "fc2" in name:
+                            nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
+                        else:
+                            nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
 
         else:
             n_residuals += self.encoder.height + self.decoder.height

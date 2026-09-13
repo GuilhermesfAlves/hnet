@@ -30,6 +30,7 @@ for i in "${!hnet_names[@]}";do
         	--dataset-name uonlp/CulturaX \
 	        --dataset-config-name pt \
 			--csv-path checkpoints/train_pt/$hnet.metrics.txt \
+			--out-dir checkpoints/train_pt/$hnet \
 	        --text-column text \
 			--seq-len $seq_len \
 			--batch-size $batch \

@@ -1,5 +1,6 @@
 from collections import namedtuple
 from dataclasses import dataclass
+import json
 
 import torch
 import torch.nn as nn
@@ -7,7 +8,7 @@ import torch.nn as nn
 from ..modules.flash_attn_ops_compat import GenerationMixin
 
 from .hnet import HNet, HNetState
-from .config_hnet import HNetConfig
+from .config_hnet import AttnConfig, HNetConfig, SSMConfig
 
 from hnet.modules.dc import RoutingModuleOutput
 from hnet.modules.utils import apply_optimization_params
@@ -17,6 +18,21 @@ class CausalLMOutput:
     logits: torch.Tensor
     bpred_output: list[RoutingModuleOutput]
     inference_params: HNetState
+
+
+def find_frozen_external_modules(model: torch.nn.Module) -> list:
+    """Módulos que o próprio HNet/Isotropic já marcou como backbone externo congelado."""
+    return [m for m in model.modules() if getattr(m, "_is_frozen_external", False)]
+
+def build_model(model_config_path: str, device: str, dtype: torch.dtype):
+    with open(model_config_path) as f:
+        config = json.load(f)
+    attn_cfg = AttnConfig(**config.pop("attn_cfg"))
+    ssm_cfg  = SSMConfig(**config.pop("ssm_cfg"))
+    hnet_cfg = HNetConfig(**config, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg)
+    model    = HNetForCausalLM(hnet_cfg, device=device, dtype=dtype)
+    model.init_weights()
+    return model, hnet_cfg
 
 
 class HNetForCausalLM(nn.Module, GenerationMixin):

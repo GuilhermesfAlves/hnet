@@ -56,13 +56,22 @@ class Isotropic(nn.Module):
 
         self.stage_idx = stage_idx
         self.d_model = config.d_model[self.stage_idx]
-        self.ssm_cfg = get_stage_cfg(config.ssm_cfg, stage_idx)
-        self.attn_cfg = get_stage_cfg(config.attn_cfg, stage_idx)
 
         arch_layout = config.arch_layout
         for _ in range(stage_idx):
             arch_layout = arch_layout[1]
         arch_layout = arch_layout[pos_idx]
+
+        # ── NOVO: backbone externo pré-treinado (ex.: Llama) ──────────────────
+        external_cfg = config.external_backbones.get(arch_layout)
+        if external_cfg is not None:
+            self._init_external(external_cfg, device=device, dtype=dtype)
+            return
+        self.is_external = False
+        self.is_frozen_external = False
+
+        self.ssm_cfg = get_stage_cfg(config.ssm_cfg, stage_idx)
+        self.attn_cfg = get_stage_cfg(config.attn_cfg, stage_idx)
         layout_parse = re.findall(r"([mMtT])(\d+)", arch_layout)
 
         layers = []
@@ -97,6 +106,31 @@ class Isotropic(nn.Module):
 
         self.rmsnorm = RMSNorm(self.d_model, eps=1e-5, **factory_kwargs)
 
+    def _init_external(self, external_cfg, device=None, dtype=None):
+        from transformers import AutoModel
+
+        self.is_external = True
+        self.is_frozen_external = external_cfg.frozen
+        self.height = 0  # não participa da contagem de residuals nativa do H-Net
+
+        self.external_model = AutoModel.from_pretrained(
+            external_cfg.hf_model, torch_dtype=next(iter([dtype])) or None
+        )
+        self.external_model.to(device=device, dtype=dtype)
+
+        hf_hidden = getattr(self.external_model.config, "hidden_size", None)
+        if hf_hidden != self.d_model:
+            raise ValueError(
+                f"d_model do estágio ({self.d_model}) != hidden_size de "
+                f"'{external_cfg.hf_model}' ({hf_hidden}). Ajuste d_model no "
+                f"model-config pra bater com o backbone."
+            )
+
+        if external_cfg.frozen:
+            for p in self.external_model.parameters():
+                p.requires_grad_(False)
+            self.external_model.eval()
+
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """
         Allocate the inference cache for the Isotropic module.
@@ -108,6 +142,8 @@ class Isotropic(nn.Module):
 
         The inference cache contains a list of inference caches, one for each block.
         """
+        if self.is_external:
+            return None
         key_value_memory_dict = {}
         for i, layer in enumerate(self.layers):
             key_value_memory_dict[i] = layer.allocate_inference_cache(
@@ -128,6 +164,8 @@ class Isotropic(nn.Module):
         inference_params=None,
         **mixer_kwargs,
     ):
+        if self.is_external:
+            return self._forward_external(hidden_states, cu_seqlens, mask)
         assert (mask is not None) or (
             cu_seqlens is not None and max_seqlen is not None
         ), "Either mask or cu_seqlens and max_seqlen must be provided"
@@ -185,6 +223,32 @@ class Isotropic(nn.Module):
             inference_params.seqlen_offset += hidden_states.shape[1]
 
         return hidden_states
+
+    def _forward_external(self, hidden_states, cu_seqlens, mask):
+        if self.is_external:
+            raise NotImplementedError(
+                "Geração passo-a-passo com backbone externo ainda não suportada "
+                "(precisaria do KV-cache nativo do HF, não do IsotropicInferenceParams)."
+            )
+        if mask is not None:
+            # modo unpacked: já é (B, L, D)
+            assert hidden_states.dim() == 3
+            attn_mask = mask.to(dtype=torch.long)
+            out = self.external_model(inputs_embeds=hidden_states, attention_mask=attn_mask)
+            return out.last_hidden_state
+
+        # modo packed: (total_tokens, D) + cu_seqlens -> despacota, roda, repacota
+        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        chunks = torch.split(hidden_states, seq_lens, dim=0)
+        padded = torch.nn.utils.rnn.pad_sequence(chunks, batch_first=True)  # (B, Lmax, D)
+
+        B, Lmax = padded.shape[0], padded.shape[1]
+        attn_mask = torch.zeros(B, Lmax, dtype=torch.long, device=hidden_states.device)
+        for i, L in enumerate(seq_lens):
+            attn_mask[i, :L] = 1
+
+        out = self.external_model(inputs_embeds=padded, attention_mask=attn_mask).last_hidden_state
+        return torch.cat([out[i, :L] for i, L in enumerate(seq_lens)], dim=0)
 
     def step(self, hidden_states, inference_params):
         """

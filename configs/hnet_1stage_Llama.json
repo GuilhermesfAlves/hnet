@@ -1,0 +1,21 @@
+{
+    "arch_layout": ["m4", ["Llama"], "m4"],
+    "d_model": [3072, 1536],
+    "d_intermediate": [12288, 4096],
+    "vocab_size": 256,
+    "ssm_cfg": {
+        "chunk_size": 256,
+        "d_conv": 4,
+        "d_state": 128,
+        "expand": 2
+    },
+    "attn_cfg": {
+        "num_heads": [16, 16],
+        "rotary_emb_dim": [32, 48],
+        "window_size": [1023, -1]
+    },
+    "tie_embeddings": false,
+    "external_backbones": {
+        "Llama": { "hf_model": "meta-llama/Llama-3.2-3B", "frozen": true }
+    }
+}
