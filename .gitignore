@@ -202,3 +202,4 @@ output*.err
 *.log
 *.out
 notes
+output/

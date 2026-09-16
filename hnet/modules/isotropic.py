@@ -1,8 +1,9 @@
 import re
 import copy
 from dataclasses import dataclass, field
-
+import os
 import optree
+from dotenv import load_dotenv
 
 from typing import Optional
 
@@ -15,6 +16,8 @@ from hnet.modules.block import create_block
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
 from hnet.models.config_hnet import HNetConfig
+
+load_dotenv()
 
 
 @dataclass
@@ -106,16 +109,14 @@ class Isotropic(nn.Module):
 
         self.rmsnorm = RMSNorm(self.d_model, eps=1e-5, **factory_kwargs)
 
-    def _init_external(self, external_cfg, device=None, dtype=None):
+    def _init_external(self, external_cfg, device=None, dtype=None,
+                       HF_TOKEN=os.getenv("HUGGING_FACE_TOKEN")):
         from transformers import AutoModel
-
         self.is_external = True
         self.is_frozen_external = external_cfg.frozen
         self.height = 0  # não participa da contagem de residuals nativa do H-Net
 
-        self.external_model = AutoModel.from_pretrained(
-            external_cfg.hf_model, torch_dtype=next(iter([dtype])) or None
-        )
+        self.external_model = AutoModel.from_pretrained(external_cfg.hf_model, dtype=next(iter([dtype])) or None, token=HF_TOKEN)
         self.external_model.to(device=device, dtype=dtype)
 
         hf_hidden = getattr(self.external_model.config, "hidden_size", None)
@@ -225,11 +226,6 @@ class Isotropic(nn.Module):
         return hidden_states
 
     def _forward_external(self, hidden_states, cu_seqlens, mask):
-        if self.is_external:
-            raise NotImplementedError(
-                "Geração passo-a-passo com backbone externo ainda não suportada "
-                "(precisaria do KV-cache nativo do HF, não do IsotropicInferenceParams)."
-            )
         if mask is not None:
             # modo unpacked: já é (B, L, D)
             assert hidden_states.dim() == 3

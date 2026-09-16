@@ -8,7 +8,7 @@ import torch.nn as nn
 from ..modules.flash_attn_ops_compat import GenerationMixin
 
 from .hnet import HNet, HNetState
-from .config_hnet import AttnConfig, HNetConfig, SSMConfig
+from .config_hnet import AttnConfig, HNetConfig, SSMConfig, ExternalBackboneConfig
 
 from hnet.modules.dc import RoutingModuleOutput
 from hnet.modules.utils import apply_optimization_params
@@ -18,6 +18,47 @@ class CausalLMOutput:
     logits: torch.Tensor
     bpred_output: list[RoutingModuleOutput]
     inference_params: HNetState
+
+def load_from_checkpoint(
+    model_config_path: str,
+    checkpoint_path: str,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """
+    Reconstrói o HNetForCausalLM a partir do model-config e carrega os pesos
+    de um checkpoint salvo por train_pt.py.
+
+    Retorna: (model, hnet_cfg, ckpt_meta)
+    ckpt_meta é um dict com pelo menos {"step": int, "total_tokens": int}.
+    """
+    model, hnet_cfg = build_model(model_config_path, device=device, dtype=dtype)
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+        ckpt_meta = {
+            "step": ckpt.get("step", 0),
+            "total_tokens": ckpt.get("total_tokens", 0),
+        }
+    else:
+        # checkpoint antigo (state_dict puro, sem wrapper)
+        state_dict = ckpt
+        ckpt_meta = {"step": 0, "total_tokens": 0}
+
+    frozen_modules = find_frozen_external_modules(model)
+    strict = len(frozen_modules) == 0
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=strict)
+    if missing:
+        print(f"[load_from_checkpoint] {len(missing)} chaves ausentes "
+              f"(esperado se forem do backbone externo congelado)")
+    if unexpected:
+        print(f"[load_from_checkpoint] {len(unexpected)} chaves inesperadas: "
+              f"{unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+    return model, hnet_cfg, ckpt_meta
 
 
 def find_frozen_external_modules(model: torch.nn.Module) -> list:
@@ -29,7 +70,12 @@ def build_model(model_config_path: str, device: str, dtype: torch.dtype):
         config = json.load(f)
     attn_cfg = AttnConfig(**config.pop("attn_cfg"))
     ssm_cfg  = SSMConfig(**config.pop("ssm_cfg"))
-    hnet_cfg = HNetConfig(**config, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg)
+    external_backbones_raw = config.pop("external_backbones", {})
+    external_backbones = {
+        name: ExternalBackboneConfig(**cfg)
+        for name, cfg in external_backbones_raw.items()
+    }
+    hnet_cfg = HNetConfig(**config, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg, external_backbones=external_backbones)
     model    = HNetForCausalLM(hnet_cfg, device=device, dtype=dtype)
     model.init_weights()
     return model, hnet_cfg

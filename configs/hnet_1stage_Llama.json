@@ -1,7 +1,7 @@
 {
     "arch_layout": ["m4", ["Llama"], "m4"],
-    "d_model": [3072, 1536],
-    "d_intermediate": [12288, 4096],
+    "d_model": [1024, 3072],
+    "d_intermediate": [4096, 0],
     "vocab_size": 256,
     "ssm_cfg": {
         "chunk_size": 256,

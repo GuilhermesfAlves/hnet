@@ -1,5 +1,16 @@
 #!/bin/bash
 
+#SBATCH -p gpu  	       # Partition ou queue de GPU
+#SBATCH --job-name=hnet-optim  # Nome do job
+#SBATCH -N 1                   # Número de nós (1 nó)
+#SBATCH -n 1                   # Número de tasks
+#SBATCH -c 8                   # CPUs por task
+#SBATCH --gres=gpu:V100:4      # Número de GPUs (2 GPU)
+#SBATCH --mem=32G              # Memória total
+#SBATCH -o ./optim_%j.log      # Arquivo de log (adiciona job id %j)
+#SBATCH -e ./optim_%j.err      # Arquivo de erro (adiciona job id %j)
+#SBATCH --time=72:00:00        # Tempo máximo de execução (hh:mm:ss)
+
 set -u
 
 # ============================================================

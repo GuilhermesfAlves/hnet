@@ -40,7 +40,7 @@ from hnet.utils.metrics import (
     compute_compression_ratio,
     compute_ratio_loss,
 )
-from hnet.models.mixer_seq import build_model, find_frozen_external_modules
+from hnet.models.mixer_seq import build_model, find_frozen_external_modules, load_from_checkpoint
 from train.evaluate import evaluate
 from hnet.utils.datasets import ByteConcatDataset, collate_fn
 from hnet.utils.distributed import setup_distributed
@@ -168,29 +168,31 @@ def main():
     # modelo
     if is_main:
         print("Construindo modelo...")
-    model, hnet_cfg = build_model(args.model_config, device=device, dtype=dtype)
+
+    start_step = 0
+    total_tokens = 0
+
+    if args.resume_from:
+        if is_main:
+            print(f"Retomando de {args.resume_from}")
+        model, hnet_cfg, ckpt_meta = load_from_checkpoint(
+            model_config_path=args.model_config,
+            checkpoint_path=args.resume_from,
+            device=device,
+            dtype=dtype,
+        )
+        start_step = ckpt_meta.get("step", 0)
+        total_tokens = ckpt_meta.get("total_tokens", 0)
+    if is_main:
+            print(f"Retomando a partir do passo {start_step} ({total_tokens/1e9:.2f}B tokens)")
+    else:
+        model, hnet_cfg = build_model(args.model_config, device=device, dtype=dtype)
+
     n_boundary_stages = count_boundary_stages(hnet_cfg.arch_layout)
     n_total_stages    = n_boundary_stages + 1
 
     if is_main:
         print(f"Hierarquia: {n_total_stages} estágio(s), {n_boundary_stages} módulo(s) de roteamento")
-
-    start_step = 0
-    if args.resume_from:
-        if is_main:
-            print(f"Retomando de {args.resume_from}")
-        ckpt = torch.load(args.resume_from, map_location=device)
-        # Na retomada:
-        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            # missing = pesos do Llama que estão em memória mas não em disco (esperado)
-            # unexpected = vazio
-            start_step = ckpt.get("step", 0)
-            total_tokens = ckpt.get("total_tokens", 0)
-        if is_main:
-            print(f"Retomando a partir do passo {start_step}")
-
-    if is_main:
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_frozen    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
         print(f"Parâmetros treináveis: {n_trainable/1e6:.1f}M | congelados: {n_frozen/1e6:.1f}M")
@@ -304,22 +306,21 @@ def main():
             ratio_loss   = torch.zeros((), device=device)
             stage_ratios = {}
             bpic         = 0.0
-            has_hnet     = (
-                hasattr(output, "boundary_probs_list") and
-                hasattr(output, "boundary_ind_list")
-            )
-            if has_hnet and lb_n:
-                for b_probs, b_inds, N in zip(
-                    output.boundary_probs_list, output.boundary_ind_list, lb_n
-                ):
-                    ratio_loss = ratio_loss + compute_ratio_loss(b_probs, b_inds, N)
-                lb_loss = ratio_loss   # substitui o lb_loss genérico
-
-                for s, b_ind in enumerate(output.boundary_ind_list):
+            
+            if output.bpred_output and lb_n:
+                boundary_ind_list = []
+                for s, (bpred, N) in enumerate(zip(output.bpred_output, lb_n)):
+                    boundary_probs = bpred.boundary_prob[..., 1]   # prob contínua de ser boundary
+                    boundary_ind   = bpred.boundary_mask.float()   # 0/1 discreto
+                    boundary_ind_list.append(boundary_ind)
+ 
+                    ratio_loss = ratio_loss + compute_ratio_loss(boundary_probs, boundary_ind, N)
+ 
                     key = f"compression_L{s+1}/L{s}"
-                    stage_ratios[key] = compute_compression_ratio(b_ind)
-
-                bpic = compute_bpic(L0, output.boundary_ind_list)
+                    stage_ratios[key] = compute_compression_ratio(boundary_ind)
+ 
+                lb_loss = ratio_loss   # substitui o lb_loss genérico
+                bpic = compute_bpic(L0, boundary_ind_list)
 
             loss = lm_loss + args.load_balancing_weight * lb_loss
             (loss / args.grad_accum_steps).backward()
