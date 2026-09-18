@@ -31,6 +31,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from dotenv import load_dotenv
 
+from hnet.utils.load_texts import load_texts
+from hnet.utils.boundary_probe import boundary_probe
 from hnet.utils.train import load_balancing_loss, group_params
 from hnet.utils.csv_logger import CsvLogger
 from hnet.utils.arch import count_boundary_stages
@@ -69,19 +71,20 @@ def main():
     parser.add_argument("--resume-from",   type=str, default=None)
 
     # treino
-    parser.add_argument("--seq-len",              type=int,   default=4096)
-    parser.add_argument("--batch-size",           type=int,   default=8)
-    parser.add_argument("--grad-accum-steps",     type=int,   default=1)
-    parser.add_argument("--max-steps",            type=int,   default=None)
-    parser.add_argument("--max-tokens",           type=int,   default=None)
-    parser.add_argument("--warmup-steps",         type=int,   default=1000)
-    parser.add_argument("--lr",                   type=float, default=3e-4)
-    parser.add_argument("--min-lr",               type=float, default=3e-5)
-    parser.add_argument("--weight-decay",         type=float, default=0.1)
-    parser.add_argument("--grad-clip",            type=float, default=1.0)
-    parser.add_argument("--lr-multiplier",        type=str,   default=None)
-    parser.add_argument("--load-balancing-n",     type=str,   default=None)
-    parser.add_argument("--load-balancing-weight",type=float, default=0.03)
+    parser.add_argument("--seq-len",                     type=int,   default=4096)
+    parser.add_argument("--batch-size",                  type=int,   default=8)
+    parser.add_argument("--grad-accum-steps",            type=int,   default=1)
+    parser.add_argument("--max-steps",                   type=int,   default=None)
+    parser.add_argument("--max-tokens",                  type=int,   default=None)
+    parser.add_argument("--warmup-steps",                type=int,   default=1000)
+    parser.add_argument("--lr",                          type=float, default=3e-4)
+    parser.add_argument("--min-lr",                      type=float, default=3e-5)
+    parser.add_argument("--weight-decay",                type=float, default=0.1)
+    parser.add_argument("--grad-clip",                   type=float, default=1.0)
+    parser.add_argument("--lr-multiplier",               type=str,   default=None)
+    parser.add_argument("--load-balancing-n",            type=str,   default=None)
+    parser.add_argument("--load-balancing-weight",       type=float, default=0.03)
+    parser.add_argument("--path-output-boundary-probe",  type=str,   default="texts/output")
 
     # infra
     parser.add_argument("--num-workers",               type=int, default=2)
@@ -171,6 +174,8 @@ def main():
 
     start_step = 0
     total_tokens = 0
+
+    texts_boundary_probe = load_texts("text/input")
 
     if args.resume_from:
         if is_main:
@@ -399,6 +404,9 @@ def main():
             train_metrics.reset()
             steps_since_log = 0
             t0 = time.time()
+
+        if is_main and step % 1000 == 0:
+            boundary_probe(raw_model, step, texts_boundary_probe, args.path_output_boundary_probe, device)
 
         # ── validação ────────────────────────────────────────────────────────
         if is_main and val_loader and step > 0 and step % args.eval_every == 0:
