@@ -10,9 +10,9 @@
 #SBATCH -o ./output_%j.log     # Arquivo de log (adiciona job id %j)
 #SBATCH -e ./output_%j.err     # Arquivo de erro (adiciona job id %j)
 
-hnet_names=("hnet_1stage_Llama")
-batch_sizes=(8)
-sequence_lengths=(512)
+hnet_names=("hnet_1stage_L")
+batch_sizes=(12)
+sequence_lengths=(768)
 
 for i in "${!hnet_names[@]}";do
 	hnet="${hnet_names[$i]}"
@@ -33,9 +33,8 @@ for i in "${!hnet_names[@]}";do
 		--seq-len $seq_len \
 		--batch-size $batch \
 		--no-streaming \
-		--max-tokens 500_000_000 \
+		--max-tokens 2_000_000_000 \
 		--num-workers 16 \
-		--resume-from checkpoints/train_pt/$hnet/step_9000.pt \
         	--model-config configs/$hnet.json > output/train_output.$hnet.txt
 
 	kill $NVIDIA_SMI_PID

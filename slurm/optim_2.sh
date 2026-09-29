@@ -4,9 +4,8 @@
 #SBATCH --job-name=hnet-optim  # Nome do job
 #SBATCH -N 1                   # Número de nós (1 nó)
 #SBATCH -n 1                   # Número de tasks
-#SBATCH -c 16                   # CPUs por task
-#SBATCH --gres=gpu:V100:4      # Número de GPUs (4 GPU)
-#SBATCH --mem-per-gpu=32G      # Total de RAM por GPU
+#SBATCH -c 16                  # CPUs por task
+#SBATCH --gres=gpu:V100:4      # Número de GPUs (2 GPU)
 #SBATCH -o ./optim_%j.log      # Arquivo de log (adiciona job id %j)
 #SBATCH -e ./optim_%j.err      # Arquivo de erro (adiciona job id %j)
 
@@ -18,8 +17,8 @@ set -u
 
 hnet_names=(
     "hnet_1stage_L"
-    "hnet_2stage_L"
     "hnet_1stage_Llama"
+    "hnet_2stage_L"
 )
 
 # seq_len deve ser múltiplo do chunk_size=256
@@ -31,17 +30,18 @@ sequence_lengths=(
 
 # Testaremos esses batch sizes em ordem crescente.
 batch_candidates=(
+    2
+    4
+    6
     8
     10
     12
-    14
     16
-    18
 )
 
 # Não queremos chegar exatamente aos 32 GB.
 # 30 GB = margem de ~2 GB para CUDA/NCCL/kernels.
-MAX_VRAM_MB=32768
+MAX_VRAM_MB=30720
 
 # Quantos steps executar no teste.
 #
@@ -50,17 +50,42 @@ MAX_VRAM_MB=32768
 # usa para limitar steps, caso exista.
 BENCHMARK_STEPS=20
 
+# Intervalo (segundos) de amostragem do nvidia-smi durante cada teste.
+NVIDIA_SMI_INTERVAL=1
+
 # Diretórios
-METRICS_DIR="checkpoints/train_pt"
-OUTPUT_DIR="output"
+METRICS_DIR="checkpoints/train_pt/optim2"
+OUTPUT_DIR="output/optim2"
+SMI_DIR="$OUTPUT_DIR/nvidia_smi_logs"
 
 mkdir -p "$METRICS_DIR"
 mkdir -p "$OUTPUT_DIR"
+mkdir -p "$SMI_DIR"
 
 RESULTS="$OUTPUT_DIR/batch_seq_sweep.csv"
 
-echo "model,seq_len,batch_size,tokens_per_gpu,status,max_vram_mb" \
+echo "model,seq_len,batch_size,tokens_per_gpu,status,max_vram_mb,nvidia_smi_max_vram_mb,nvidia_smi_max_vram_gpu" \
     > "$RESULTS"
+
+# ------------------------------------------------------------
+# PID do nvidia-smi em background (rastreado globalmente para o
+# trap de saída conseguir limpar mesmo se o script for
+# interrompido no meio de um teste).
+# ------------------------------------------------------------
+
+SMI_PID=""
+
+cleanup_smi() {
+    if [ -n "$SMI_PID" ] && kill -0 "$SMI_PID" 2>/dev/null; then
+        kill "$SMI_PID" 2>/dev/null
+        wait "$SMI_PID" 2>/dev/null
+    fi
+    SMI_PID=""
+}
+
+# Garante que nenhum nvidia-smi fique "pendurado" se o job for
+# cancelado (timeout do Slurm, Ctrl+C, etc.)
+trap cleanup_smi EXIT INT TERM
 
 # ============================================================
 # Testa uma configuração
@@ -73,6 +98,7 @@ test_config() {
     local seq_len="$3"
 
     local log_file="$OUTPUT_DIR/sweep.${hnet}.b${batch}.s${seq_len}.txt"
+    local smi_log="$SMI_DIR/sweep.${hnet}.b${batch}.s${seq_len}.csv"
 
     echo
     echo "============================================================"
@@ -87,6 +113,20 @@ test_config() {
     # --------------------------------------------------------
 
     sync
+
+    # --------------------------------------------------------
+    # Inicia o nvidia-smi em background, amostrando todas as
+    # GPUs do nó a cada NVIDIA_SMI_INTERVAL segundos, durante
+    # toda a execução do teste.
+    # --------------------------------------------------------
+
+    nvidia-smi \
+        --query-gpu=timestamp,index,name,memory.used,memory.total,utilization.gpu \
+        --format=csv \
+        -l "$NVIDIA_SMI_INTERVAL" \
+        > "$smi_log" 2>/dev/null &
+    SMI_PID=$!
+
     srun --export=ALL \
         python -m torch.distributed.run \
         --nproc_per_node=4 \
@@ -107,7 +147,14 @@ test_config() {
     local exit_code=$?
 
     # --------------------------------------------------------
-    # Verifica OOM
+    # Para o nvidia-smi assim que o treino termina — sem isso
+    # ele continuaria rodando indefinidamente (-l é um loop).
+    # --------------------------------------------------------
+
+    cleanup_smi
+
+    # --------------------------------------------------------
+    # VRAM segundo o próprio PyTorch (torch.cuda.max_memory_allocated)
     # --------------------------------------------------------
 
     local max_vram
@@ -116,6 +163,40 @@ test_config() {
         sort -n |
         tail -1)
 
+    # --------------------------------------------------------
+    # VRAM segundo o nvidia-smi (uso real da placa, incluindo
+    # overhead de CUDA context/NCCL que o PyTorch não reporta).
+    # Pega o maior valor de memory.used entre TODAS as GPUs e
+    # TODOS os timestamps amostrados durante o teste, e também
+    # qual GPU (index) teve esse pico.
+    # --------------------------------------------------------
+
+    local nvidia_smi_result
+    nvidia_smi_result=$(awk -F',' '
+        NR == 1 { next }  # pula o header do nvidia-smi
+        {
+            gsub(/ MiB/, "", $4)
+            gsub(/^[ \t]+|[ \t]+$/, "", $4)
+            gsub(/^[ \t]+|[ \t]+$/, "", $2)
+            mem = $4 + 0
+            if (mem > max) {
+                max = mem
+                max_gpu = $2
+            }
+        }
+        END {
+            if (max == "") { print "0,NA" }
+            else { print max "," max_gpu }
+        }
+    ' "$smi_log")
+
+    local nvidia_smi_max_vram="${nvidia_smi_result%%,*}"
+    local nvidia_smi_max_gpu="${nvidia_smi_result##*,}"
+
+    # --------------------------------------------------------
+    # Verifica OOM
+    # --------------------------------------------------------
+
     if [ "$exit_code" -ne 0 ]; then
 
         if grep -qiE \
@@ -123,7 +204,8 @@ test_config() {
             "$log_file"; then
 
             echo "OOM"
-            echo "$hnet,$seq_len,$batch,$((batch * seq_len)),OOM,$max_vram" \
+            echo "VRAM (torch): ${max_vram} MB | VRAM (nvidia-smi): ${nvidia_smi_max_vram} MB (GPU $nvidia_smi_max_gpu)"
+            echo "$hnet,$seq_len,$batch,$((batch * seq_len)),OOM,$max_vram,$nvidia_smi_max_vram,$nvidia_smi_max_gpu" \
                 >> "$RESULTS"
 
             return 1
@@ -131,7 +213,7 @@ test_config() {
         else
 
             echo "ERRO (exit code $exit_code)"
-            echo "$hnet,$seq_len,$batch,$((batch * seq_len)),ERROR,$max_vram" \
+            echo "$hnet,$seq_len,$batch,$((batch * seq_len)),ERROR,$max_vram,$nvidia_smi_max_vram,$nvidia_smi_max_gpu" \
                 >> "$RESULTS"
 
             return 2
@@ -145,8 +227,8 @@ test_config() {
     # --------------------------------------------------------
 
     echo "OK"
-    echo "VRAM máxima: ${max_vram} MB"
-    echo "$hnet,$seq_len,$batch,$((batch * seq_len)),OK,$max_vram" \
+    echo "VRAM (torch): ${max_vram} MB | VRAM (nvidia-smi): ${nvidia_smi_max_vram} MB (GPU $nvidia_smi_max_gpu)"
+    echo "$hnet,$seq_len,$batch,$((batch * seq_len)),OK,$max_vram,$nvidia_smi_max_vram,$nvidia_smi_max_gpu" \
         >> "$RESULTS"
     return 0
 }
@@ -231,8 +313,11 @@ awk -F',' '{
     for (i = 1; i <= NF; i++)
         printf "%-20s", $i
     print ""
-}' resultado_optim.csv
+}' "$RESULTS"
 
 echo
-echo "Arquivo:"
+echo "Arquivo de resultados:"
 echo "$RESULTS"
+echo
+echo "Logs de nvidia-smi por configuração em:"
+echo "$SMI_DIR/"

@@ -183,7 +183,7 @@ def main():
         )
         start_step = ckpt_meta.get("step", 0)
         total_tokens = ckpt_meta.get("total_tokens", 0)
-    if is_main:
+        if is_main:
             print(f"Retomando a partir do passo {start_step} ({total_tokens/1e9:.2f}B tokens)")
     else:
         model, hnet_cfg = build_model(args.model_config, device=device, dtype=dtype)
