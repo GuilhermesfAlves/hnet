@@ -41,11 +41,21 @@ def load_from_checkpoint(
         ckpt_meta = {
             "step": ckpt.get("step", 0),
             "total_tokens": ckpt.get("total_tokens", 0),
+            "wall_time": ckpt.get("wall_time", 0.0),
+            "optimizer_state_dict": ckpt.get("optimizer_state_dict"),
+            "data_cfg": ckpt.get("data_cfg"),
         }
     else:
         # checkpoint antigo (state_dict puro, sem wrapper)
         state_dict = ckpt
-        ckpt_meta = {"step": 0, "total_tokens": 0}
+        ckpt_meta = {
+            "step": 0,
+            "total_tokens": 0,
+            "wall_time": 0.0,
+            "optimizer_state_dict": None,
+            "data_cfg": None,
+        }
+
 
     frozen_modules = find_frozen_external_modules(model)
     strict = len(frozen_modules) == 0
@@ -57,7 +67,7 @@ def load_from_checkpoint(
     if unexpected:
         print(f"[load_from_checkpoint] {len(unexpected)} chaves inesperadas: "
               f"{unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
-
+    del ckpt
     return model, hnet_cfg, ckpt_meta
 
 

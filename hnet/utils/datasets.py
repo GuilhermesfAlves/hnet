@@ -22,6 +22,8 @@ class ByteConcatDataset(IterableDataset):
         trust_remote_code: bool = False,
         rank: int = 0,
         world_size: int = 1,
+        batch_size: int = 1,
+        skip_batches: int = 0,
     ):
         super().__init__()
         self.dataset_name        = dataset_name
@@ -38,6 +40,8 @@ class ByteConcatDataset(IterableDataset):
         self.rank                = rank
         self.world_size          = world_size
         self.tokenizer           = ByteTokenizer()
+        self.batch_size          = batch_size
+        self.skip_batches        = skip_batches   # por rank
 
     def _load_hf_dataset(self):
         kwargs = {}
@@ -62,6 +66,10 @@ class ByteConcatDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[np.ndarray]:
         worker_info = torch.utils.data.get_worker_info()
+        nw  = worker_info.num_workers if worker_info else 1
+        wid = worker_info.id if worker_info else 0
+        k   = self.skip_batches // nw + (1 if wid < self.skip_batches % nw else 0)
+        to_skip = k * self.batch_size      # chunks a descartar neste worker
         ds = self._load_hf_dataset()
         if worker_info is not None:
             ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
@@ -82,6 +90,9 @@ class ByteConcatDataset(IterableDataset):
             while len(buffer) >= block_len:
                 chunk  = buffer[:block_len]
                 buffer = buffer[block_len:]
+                if to_skip > 0:
+                    to_skip -= 1
+                    continue
                 yield chunk
 
 

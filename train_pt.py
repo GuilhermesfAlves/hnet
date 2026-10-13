@@ -47,6 +47,29 @@ from hnet.utils.distributed import setup_distributed
 load_dotenv()
 HF_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
 
+DATA_CFG_ARGS = {
+    "seed":                "seed",
+    "batch_size":          "batch_size",
+    "num_workers":         "num_workers",
+    "seq_len":             "seq_len",
+    "grad_accum_steps":    "grad_accum_steps",
+    "dataset_name":        "dataset_name",
+    "dataset_config_name": "dataset_config_name",
+    "dataset_split":       "dataset_split",
+}
+
+def apply_data_cfg(args, data_cfg, world_size, is_main):
+    if not data_cfg:
+        return
+    for key, attr in DATA_CFG_ARGS.items():
+        if key in data_cfg and getattr(args, attr) != data_cfg[key]:
+            if is_main:
+                print(f"[resume] {attr}: {getattr(args, attr)} -> {data_cfg[key]} (do checkpoint)")
+            setattr(args, attr, data_cfg[key])
+    # world_size vem do lançamento (torchrun), não dá para sobrescrever
+    if data_cfg.get("world_size") not in (None, world_size) and is_main:
+        print(f"AVISO: world_size do checkpoint = {data_cfg['world_size']}, atual = {world_size}. "
+              f"O skip do dataset não será exato.")
 
 # --------------------------------------------------------------------------- #
 # Main
@@ -117,7 +140,6 @@ def main():
     rank, world_size, local_rank, is_distributed = setup_distributed()
     is_main = rank == 0
 
-    torch.manual_seed(args.seed + rank)
     if is_main:
         os.makedirs(args.out_dir, exist_ok=True)
     if is_distributed:
@@ -132,46 +154,13 @@ def main():
     if is_main:
         print(f"Distribuído: {is_distributed} | world_size={world_size} | device={device}")
 
-    # dataset
-    dataset = ByteConcatDataset(
-        dataset_name=args.dataset_name,
-        dataset_config_name=args.dataset_config_name,
-        split=args.dataset_split,
-        text_column=args.text_column,
-        seq_len=args.seq_len,
-        streaming=args.streaming,
-        seed=args.seed,
-        hf_token=HF_TOKEN,
-        trust_remote_code=args.trust_remote_code,
-        rank=rank,
-        world_size=world_size,
-    )
-    loader = DataLoader(dataset, batch_size=args.batch_size,
-                        collate_fn=collate_fn, num_workers=args.num_workers)
-
-    val_loader = None
-    if args.val_split and is_main:
-        val_dataset = ByteConcatDataset(
-            dataset_name=args.dataset_name,
-            dataset_config_name=args.dataset_config_name,
-            split=args.val_split,
-            text_column=args.text_column,
-            seq_len=args.seq_len,
-            streaming=args.streaming,
-            seed=args.seed,
-            hf_token=HF_TOKEN,
-            trust_remote_code=args.trust_remote_code,
-        )
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
-                                collate_fn=collate_fn, num_workers=0)
-
     # modelo
     if is_main:
         print("Construindo modelo...")
 
     start_step = 0
     total_tokens = 0
-
+    ckpt_meta = {}
     if args.resume_from:
         if is_main:
             print(f"Retomando de {args.resume_from}")
@@ -183,10 +172,12 @@ def main():
         )
         start_step = ckpt_meta.get("step", 0)
         total_tokens = ckpt_meta.get("total_tokens", 0)
+        apply_data_cfg(args, ckpt_meta.get("data_cfg"), world_size, is_main)
         if is_main:
             print(f"Retomando a partir do passo {start_step} ({total_tokens/1e9:.2f}B tokens)")
     else:
         model, hnet_cfg = build_model(args.model_config, device=device, dtype=dtype)
+    torch.manual_seed(args.seed + rank)
 
     n_boundary_stages = count_boundary_stages(hnet_cfg.arch_layout)
     n_total_stages    = n_boundary_stages + 1
@@ -228,21 +219,70 @@ def main():
         g.setdefault("weight_decay", args.weight_decay)
     param_groups = [g for g in param_groups if len(g["params"]) > 0]
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    if args.resume_from:
+        opt_state = ckpt_meta.pop("optimizer_state_dict", None)
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+        elif is_main:
+            print("Aviso: checkpoint sem estado do otimizador; AdamW recomeça do zero.")
 
     raw_model = model
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=args.ddp_find_unused_parameters)
-
-    def lr_at(step):
+        
+    def lr_at_steps(step, tokens):
+        """Schedule por passos (usa --max-steps)."""
         if step < args.warmup_steps:
             return args.lr * step / max(1, args.warmup_steps)
-        # Progress ainda é baseado em steps, não tokens
-        # (se quiser variar por tokens, seria mais complexo)
-        max_steps_for_schedule = args.max_steps or 100_000
-        progress = (step - args.warmup_steps) / max(1, max_steps_for_schedule - args.warmup_steps)
+        progress = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
         cosine = 0.5 * (1 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
         return args.min_lr + (args.lr - args.min_lr) * cosine
+
+
+    def lr_at_tokens(step, tokens):
+        """Schedule por tokens (usa --max-tokens). O warmup continua em passos."""
+        if step < args.warmup_steps:
+            return args.lr * step / max(1, args.warmup_steps)
+        progress = tokens / max(1, args.max_tokens)
+        cosine = 0.5 * (1 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+        return args.min_lr + (args.lr - args.min_lr) * cosine
+
+    # dataset
+    dataset = ByteConcatDataset(
+        dataset_name=args.dataset_name,
+        dataset_config_name=args.dataset_config_name,
+        split=args.dataset_split,
+        text_column=args.text_column,
+        seq_len=args.seq_len,
+        streaming=args.streaming,
+        seed=args.seed,
+        hf_token=HF_TOKEN,
+        trust_remote_code=args.trust_remote_code,
+        rank=rank,
+        world_size=world_size,
+        batch_size=args.batch_size,
+        skip_batches=start_step * args.grad_accum_steps
+    )
+    loader = DataLoader(dataset, batch_size=args.batch_size,
+                        collate_fn=collate_fn, num_workers=args.num_workers)
+
+    val_loader = None
+    if args.val_split and is_main:
+        val_dataset = ByteConcatDataset(
+            dataset_name=args.dataset_name,
+            dataset_config_name=args.dataset_config_name,
+            split=args.val_split,
+            text_column=args.text_column,
+            seq_len=args.seq_len,
+            streaming=args.streaming,
+            seed=args.seed,
+            hf_token=HF_TOKEN,
+            trust_remote_code=args.trust_remote_code,
+            batch_size=args.batch_size,
+        )
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                                collate_fn=collate_fn, num_workers=0)
 
     # ── acumuladores ────────────────────────────────────────────────────────
     # Detectar módulos congelados que já vêm do config
@@ -255,15 +295,15 @@ def main():
         m.eval()
 
     step             = start_step
-    total_tokens     = 0
     t0               = time.time()
-    train_start      = t0
+    train_start      = time.time() - ckpt_meta.get("wall_time", 0.0) if args.resume_from else t0
     steps_since_log  = 0
 
     train_metrics = HNetMetrics()   # acumula a janela de log (resetado a cada args.log_every)
 
     optimizer.zero_grad()
     data_iter = iter(loader)
+    lr_at = lr_at_tokens if use_token_limit else lr_at_steps
 
     # ── loop principal ───────────────────────────────────────────────────────
     while True:
@@ -286,7 +326,7 @@ def main():
             targets   = targets.to(device)
             B, L0     = input_ids.shape
 
-            tokens_this_batch = B * L0
+            tokens_this_batch = B * L0 * world_size
             total_tokens += tokens_this_batch
 
             output = model(input_ids)
@@ -338,7 +378,7 @@ def main():
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-        lr = lr_at(step)
+        lr = lr_at(step, total_tokens)
         for g in optimizer.param_groups:
             g["lr"] = lr * g.get("lr_multiplier", 1.0)
 
@@ -436,11 +476,24 @@ def main():
             ckpt_path  = Path(args.out_dir) / f"step_{step}.pt"
             # No checkpoint:
             torch.save(
-                {
+                    {
                     "model_state_dict": raw_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
                     "step": step,
-                    "total_tokens": total_tokens,
-                },
+                    "total_tokens": total_tokens,          # idealmente já multiplicado por world_size
+                    "wall_time": time.time() - train_start,
+                    "data_cfg": {
+                            "seed": args.seed,
+                            "batch_size": args.batch_size,
+                            "num_workers": args.num_workers,
+                            "world_size": world_size,
+                            "seq_len": args.seq_len,
+                            "grad_accum_steps": args.grad_accum_steps,
+                            "dataset_name": args.dataset_name,
+                            "dataset_config_name": args.dataset_config_name,
+                            "dataset_split": args.dataset_split,
+                        },
+                    },
                 ckpt_path,
             )
             print(f"Checkpoint salvo em {ckpt_path}")
@@ -448,10 +501,25 @@ def main():
     if is_main:
         final = Path(args.out_dir) / "final.pt"
         torch.save({
-            "model_state_dict": raw_model.state_dict(),
-            "step": step,
-            "total_tokens": total_tokens,
-        }, final)
+                "model_state_dict": raw_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "step": step,
+                "total_tokens": total_tokens,          # idealmente já multiplicado por world_size
+                "wall_time": time.time() - train_start,
+                "data_cfg": {
+                        "seed": args.seed,
+                        "batch_size": args.batch_size,
+                        "num_workers": args.num_workers,
+                        "world_size": world_size,
+                        "seq_len": args.seq_len,
+                        "grad_accum_steps": args.grad_accum_steps,
+                        "dataset_name": args.dataset_name,
+                        "dataset_config_name": args.dataset_config_name,
+                        "dataset_split": args.dataset_split,
+                    },
+                }, 
+            final,
+        )
         print(f"Treino concluído. Checkpoint final em {final}")
         if csv_logger:
             csv_logger.close()
