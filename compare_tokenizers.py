@@ -199,7 +199,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Compara tokenizadores no mesmo texto sorteado.")
     p.add_argument("--dataset-name", required=True)
     p.add_argument("--config-name", default=None)
-    p.add_argument("--split", default="validation")
+    p.add_argument("--split", default="train")
     p.add_argument("--text-column", default="text")
     p.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--trust-remote-code", action="store_true", default=False)

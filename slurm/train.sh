@@ -10,10 +10,11 @@
 #SBATCH -o ./output_%j.log     # Arquivo de log (adiciona job id %j)
 #SBATCH -e ./output_%j.err     # Arquivo de erro (adiciona job id %j)
 
-hnet_names=("hnet_1stage_L")
-batch_sizes=(12)
+hnet_names=("hnet_2stage_L")
+#batch_sizes=(12 10 6)
+batch_sizes=(10)
+#sequence_lengths=(768 768 512)
 sequence_lengths=(768)
-
 for i in "${!hnet_names[@]}";do
 	hnet="${hnet_names[$i]}"
 	batch="${batch_sizes[$i]}"
@@ -24,6 +25,7 @@ for i in "${!hnet_names[@]}";do
 	nvidia-smi --query-gpu=timestamp,index,name,memory.used,memory.total,utilization.gpu \
     		--format=csv -l 1 > gpu/gpu_memory_train_$hnet.log &
 	NVIDIA_SMI_PID=$!
+	export PYTORCH_ALLOC_CONF=expandable_segments:True
 	srun --export=ALL python -m torch.distributed.run --nproc_per_node=4 train_pt.py \
         	--dataset-name uonlp/CulturaX \
 	        --dataset-config-name pt \
@@ -35,6 +37,7 @@ for i in "${!hnet_names[@]}";do
 		--no-streaming \
 		--max-tokens 2_000_000_000 \
 		--num-workers 16 \
+		--save-every 1500 \
         	--model-config configs/$hnet.json > output/train_output.$hnet.txt
 
 	kill $NVIDIA_SMI_PID

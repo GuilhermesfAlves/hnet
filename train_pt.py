@@ -473,6 +473,7 @@ def main():
 
         # ── checkpoint ───────────────────────────────────────────────────────
         if is_main and step > 0 and step % args.save_every == 0:
+            t_save = time.time()
             ckpt_path  = Path(args.out_dir) / f"step_{step}.pt"
             # No checkpoint:
             torch.save(
@@ -496,8 +497,9 @@ def main():
                     },
                 ckpt_path,
             )
-            print(f"Checkpoint salvo em {ckpt_path}")
-
+            print(f"Checkpoint salvo em {ckpt_path} | Delta T: ({time.time()-t_save:.0f}s)")
+        if is_distributed:
+            dist.barrier()
     if is_main:
         final = Path(args.out_dir) / "final.pt"
         torch.save({
