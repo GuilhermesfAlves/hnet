@@ -8,7 +8,7 @@ Tokenizadores (cada um é opcional; se a dependência faltar, é ignorado com av
   wordpiece  WordPiece (BERT multilíngue)       -> transformers  (--wordpiece-name)
   sentencepiece  Unigram/SentencePiece (XLM-R)  -> transformers  (--sp-name)
   spacy      tokenização por regras (palavras)  -> spacy         (--spacy-model / --spacy-lang)
-  bytes      bytes UTF-8 (a "tokenização" do H-Net)
+  bytes      bytes UTF-8
 
 Instalação:
   pip install datasets transformers tiktoken spacy sentencepiece protobuf python-dotenv
@@ -146,7 +146,7 @@ def tok_spacy(text, args):
 
 def tok_bytes(text, args):
     bs = text.encode("utf-8")
-    # agrupa os bytes de cada caractere, para exibição legível (1 byte = 1 token no H-Net)
+    # agrupa os bytes de cada caractere, para exibição legível
     pieces, raw = [], []
     for ch in text:
         b = ch.encode("utf-8")
@@ -161,7 +161,7 @@ TOKENIZERS = {
     "wordpiece": ("WordPiece (BERT)", tok_wordpiece),
     "sentencepiece": ("SentencePiece Unigram (XLM-R)", tok_sentencepiece),
     "spacy": ("spaCy (regras)", tok_spacy),
-    "bytes": ("Bytes UTF-8 (H-Net)", tok_bytes),
+    "bytes": ("Bytes UTF-8", tok_bytes),
 }
 
 

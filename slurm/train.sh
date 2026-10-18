@@ -27,18 +27,18 @@ for i in "${!hnet_names[@]}";do
 	NVIDIA_SMI_PID=$!
 	export PYTORCH_ALLOC_CONF=expandable_segments:True
 	srun --export=ALL python -m torch.distributed.run --nproc_per_node=4 train_pt.py \
-        	--dataset-name uonlp/CulturaX \
-	        --dataset-config-name pt \
+        --dataset-name uonlp/CulturaX \
+	    --dataset-config-name pt \
 		--csv-path checkpoints/train_pt/$hnet.metrics.txt \
 		--out-dir checkpoints/train_pt/$hnet \
-	        --text-column text \
+	    --text-column text \
 		--seq-len $seq_len \
 		--batch-size $batch \
 		--no-streaming \
 		--max-tokens 2_000_000_000 \
 		--num-workers 16 \
 		--save-every 1500 \
-        	--model-config configs/$hnet.json > output/train_output.$hnet.txt
+        --model-config configs/$hnet.json > output/train_output.$hnet.txt
 
 	kill $NVIDIA_SMI_PID
 done
