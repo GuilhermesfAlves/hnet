@@ -9,7 +9,16 @@ Tokenizadores (cada um é opcional; se a dependência faltar, é ignorado com av
   sentencepiece  Unigram/SentencePiece (XLM-R)  -> transformers  (--sp-name)
   spacy      tokenização por regras (palavras)  -> spacy         (--spacy-model / --spacy-lang)
   bytes      bytes UTF-8
-  hnet_1stage_L       H-Net 1 estágio (L)       -> checkpoint    (--hnet-1stage-L-config/-ckpt)
+  tucano     Tucano v1, SentencePiece 32k           -> transformers  (TucanoBR/Tucano-160m)
+  tucano2    Tucano2 (Qwen adaptado)                -> transformers  (Polygl0t/Tucano2-qwen-0.5B-Base)
+  ttl        TeenyTinyLlama, SentencePiece          -> transformers  (nicholasKluge/TeenyTinyLlama-160m)
+  gloria     GlórIA, byte-level BPE                 -> transformers  (rvlopes/GlorIA-1.3B)
+  mgpt       mGPT, byte-level BPE                   -> transformers  (ai-forever/mGPT)
+  sabia      Sabiá-7B, LLaMA BPE                    -> transformers  (maritaca-ai/sabia-7b)
+  manaca     Manacá-1B, SentencePiece unigram 64k   -> transformers  (AIInstituteLNCC/manaca-1b-base)
+  (presets acima: só o tokenizador é baixado; outros via --extra-tokenizers nome=hf:repo
+   ou nome=sp:/caminho/tokenizer.model; fora da lista padrão de --tokenizers)
+  hnet_1stage_L      H-Net 1 estágio (L)       -> checkpoint    (--hnet-1stage-L-config/-ckpt)
   hnet_2stage_L       H-Net 2 estágios (L); chunks do ÚLTIMO estágio (mais grosso)
   hnet_2stage_L_s0    H-Net 2 estágios (L); chunks do 1º estágio (mais fino)
   hnet_1stage_Llama   H-Net 1 estágio (Llama)   -> checkpoint    (--hnet-1stage-Llama-config/-ckpt)
@@ -124,10 +133,15 @@ def crop(text: str, max_chars: int, rng: random.Random) -> str:
 # --------------------------------------------------------------------------- #
 # Tokenizadores — cada um devolve lista de strings (pedaços do texto) + ids opcionais
 # --------------------------------------------------------------------------- #
+_HF_TOK_CACHE: dict = {}   # repo -> tokenizer (com N amostras não relê o tokenizer a cada texto)
+
+
 def _hf_offsets(name: str, text: str):
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(name, token=HF_TOKEN, use_fast=True)
+    if name not in _HF_TOK_CACHE:
+        _HF_TOK_CACHE[name] = AutoTokenizer.from_pretrained(name, token=HF_TOKEN, use_fast=True)
+    tok = _HF_TOK_CACHE[name]
     enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
     ids = enc["input_ids"]
     raw = tok.convert_ids_to_tokens(ids)
@@ -343,6 +357,66 @@ def _make_tok_hnet(key: str, stage: int | None):
     return fn
 
 
+# --------------------------------------------------------------------------- #
+# Tokenizadores de modelos pt-br / multilíngues (presets + --extra-tokenizers)
+# --------------------------------------------------------------------------- #
+# chave -> (rótulo, repo no HF Hub). Só o tokenizador é baixado, não os pesos.
+PRESETS = {
+    # Tucano v1 (160m/630m/1b1/2b4): tokenizer.json idêntico nos 4 repos (mesmo blob no HF)
+    "tucano": ("Tucano v1 (SentencePiece 32k)", "TucanoBR/Tucano-160m"),
+    # Tucano2 (0.6B/qwen-0.5B/1.5B/3.7B): outro tokenizador, mas igual entre os tamanhos
+    "tucano2": ("Tucano2 (Qwen adaptado, OMP)", "Polygl0t/Tucano2-qwen-0.5B-Base"),
+    "ttl": ("TeenyTinyLlama (SentencePiece)", "nicholasKluge/TeenyTinyLlama-160m"),
+    "gloria": ("GlórIA (byte-level BPE)", "rvlopes/GlorIA-1.3B"),
+    "mgpt": ("mGPT (byte-level BPE)", "ai-forever/mGPT"),
+    "sabia": ("Sabiá-7B (LLaMA BPE)", "maritaca-ai/sabia-7b"),
+    "manaca": ("Manacá-1B (SentencePiece unigram 64k)", "AIInstituteLNCC/manaca-1b-base"),
+}
+
+_SP_CACHE: dict = {}
+
+
+def tok_hf_repo(repo: str):
+    return lambda text, args: _hf_offsets(repo, text)
+
+
+def tok_sp_model(path: str):
+    """SentencePiece cru (.model): usa os offsets do próprio SentencePiece, que apontam
+    para o texto ORIGINAL. Assim normalização (nmt_nfkc_cf = NFKC + minúsculas) não
+    desalinha as peças, que aparecem com a caixa original do texto."""
+    def fn(text, args):
+        import sentencepiece as spm
+
+        if path not in _SP_CACHE:
+            _SP_CACHE[path] = spm.SentencePieceProcessor(model_file=path)
+        sp = _SP_CACHE[path]
+        proto = sp.encode(text, out_type="immutable_proto")
+        # offsets do SentencePiece são em BYTES do texto UTF-8 -> converte para caracteres
+        b2c = []
+        for ci, ch in enumerate(text):
+            b2c.extend([ci] * len(ch.encode("utf-8")))
+        b2c.append(len(text))
+        pieces, raw, ids = [], [], []
+        for p in proto.pieces:
+            a, b = b2c[p.begin], b2c[min(p.end, len(b2c) - 1)]
+            pieces.append(text[a:b])
+            raw.append(p.piece)
+            ids.append(p.id)
+        return pieces, raw, ids, sp.get_piece_size()
+    return fn
+
+
+def register_extra(spec: str):
+    """'nome=hf:org/repo' (tokenizador do HF Hub) ou 'nome=sp:/caminho/tokenizer.model'."""
+    name, _, target = spec.partition("=")
+    kind, _, value = target.partition(":")
+    name, kind, value = name.strip(), kind.strip(), value.strip()
+    if not name or not value or kind not in ("hf", "sp"):
+        raise ValueError(f"--extra-tokenizers: '{spec}' inválido; use nome=hf:repo ou nome=sp:arquivo.model")
+    fn = tok_hf_repo(value) if kind == "hf" else tok_sp_model(value)
+    TOKENIZERS[name] = (f"{name} ({kind}:{value})", fn)
+
+
 TOKENIZERS = {
     "bpe": ("BPE byte-level (GPT-2)", tok_bpe),
     "tiktoken": ("BPE byte-level (tiktoken)", tok_tiktoken),
@@ -351,6 +425,8 @@ TOKENIZERS = {
     "spacy": ("spaCy (regras)", tok_spacy),
     "bytes": ("Bytes UTF-8", tok_bytes),
 }
+for _k, (_label, _repo) in PRESETS.items():
+    TOKENIZERS[_k] = (_label, tok_hf_repo(_repo))
 for _k, _label in HNET_MODELS.items():
     TOKENIZERS[_k] = (_label, _make_tok_hnet(_k, None))
 TOKENIZERS["hnet_2stage_L_s0"] = ("H-Net 2-stage (L) — estágio 0 (mais fino)",
@@ -408,6 +484,11 @@ def parse_args():
 
     p.add_argument("--tokenizers", default="bpe,tiktoken,wordpiece,sentencepiece,spacy,bytes",
                    help=f"lista separada por vírgula; válidos: {','.join(TOKENIZERS)}")
+    p.add_argument("--extra-tokenizers", default="",
+                   help="tokenizadores extras, separados por vírgula: nome=hf:org/repo "
+                        "(HF Hub) ou nome=sp:/caminho/tokenizer.model (SentencePiece cru). "
+                        "Depois é só incluir o nome em --tokenizers. Um nome igual ao de um "
+                        "preset troca o repositório dele.")
     p.add_argument("--bpe-name", default="gpt2")
     p.add_argument("--tiktoken-name", default="cl100k_base")
     p.add_argument("--wordpiece-name", default="bert-base-multilingual-cased")
@@ -444,6 +525,12 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
+    for spec in (s for s in args.extra_tokenizers.split(",") if s.strip()):
+        try:
+            register_extra(spec)
+        except ValueError as e:
+            print(e)
+            return 2
     keys = [k.strip() for k in args.tokenizers.split(",") if k.strip()]
     bad = [k for k in keys if k not in TOKENIZERS]
     if bad:

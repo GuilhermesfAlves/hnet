@@ -12,7 +12,7 @@
 
 srun python compare_tokenizers_hnet.py \
     --dataset-name uonlp/CulturaX \
-    --tokenizers bpe,tiktoken,wordpiece,sentencepiece,spacy,hnet_1stage_L,hnet_2stage_L,hnet_2stage_L_s0,hnet_1stage_Llama \
+    --tokenizers bpe,tiktoken,wordpiece,sentencepiece,tucano,tucano2,ttl,gloria,mgpt,sabia,manaca,spacy,hnet_1stage_L,hnet_2stage_L,hnet_2stage_L_s0,hnet_1stage_Llama \
     --config-name pt \
     --hnet-1stage-L-config configs/hnet_1stage_L.json \
     --hnet-1stage-L-ckpt checkpoints/train_pt/hnet_1stage_L/final.pt \
