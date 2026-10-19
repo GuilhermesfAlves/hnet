@@ -168,20 +168,40 @@ def tok_tiktoken(text, args):
     enc = tiktoken.get_encoding(args.tiktoken_name)
     ids = enc.encode(text)
     bs = enc.decode_tokens_bytes(ids)
-    pieces = [b.decode("utf-8", errors="replace") for b in bs]   # byte parcial vira �
     raw = [repr(b)[2:-1] for b in bs]
+    # Um token pode conter só parte dos bytes de um caractere (ex.: 'ã' = c3 a3). Decodificar
+    # cada token isolado gerava '�' e quebrava o alinhamento. Em vez disso, cada fronteira de
+    # token é levada ao início do caractere que contém seu 1º byte; o token que só tem bytes
+    # parciais fica vazio ('∅') e o seguinte recebe o caractere inteiro. n_tokens é o real.
+    b2c = []
+    for ci, ch in enumerate(text):
+        b2c.extend([ci] * len(ch.encode("utf-8")))
+    b2c.append(len(text))
+    cuts, off = [], 0
+    for b in bs:
+        cuts.append(b2c[min(off, len(b2c) - 1)])
+        off += len(b)
+    cuts.append(len(text))
+    pieces = [text[a:b] for a, b in zip(cuts[:-1], cuts[1:])]
     return pieces, raw, ids, enc.n_vocab
+
+
+_SPACY_CACHE: dict = {}
 
 
 def tok_spacy(text, args):
     import spacy
 
-    try:
-        nlp = spacy.load(args.spacy_model, disable=["parser", "ner", "lemmatizer"])
-    except OSError:
-        print(f"  (modelo spaCy '{args.spacy_model}' ausente -> spacy.blank('{args.spacy_lang}'))",
-              file=sys.stderr)
-        nlp = spacy.blank(args.spacy_lang)
+    key = (args.spacy_model, args.spacy_lang)
+    if key not in _SPACY_CACHE:              # carrega (e avisa) uma vez, não a cada amostra
+        try:
+            _SPACY_CACHE[key] = spacy.load(args.spacy_model,
+                                           disable=["parser", "ner", "lemmatizer"])
+        except OSError:
+            print(f"  (modelo spaCy '{args.spacy_model}' ausente -> spacy.blank('{args.spacy_lang}'))",
+                  file=sys.stderr)
+            _SPACY_CACHE[key] = spacy.blank(args.spacy_lang)
+    nlp = _SPACY_CACHE[key]
     doc = nlp.make_doc(text)                 # só tokeniza (rápido)
     pieces = [t.text for t in doc if not t.is_space]
     return pieces, pieces, None, None
@@ -367,8 +387,8 @@ PRESETS = {
     # Tucano2 (0.6B/qwen-0.5B/1.5B/3.7B): outro tokenizador, mas igual entre os tamanhos
     "tucano2": ("Tucano2 (Qwen adaptado, OMP)", "Polygl0t/Tucano2-qwen-0.5B-Base"),
     "ttl": ("TeenyTinyLlama (SentencePiece)", "nicholasKluge/TeenyTinyLlama-160m"),
-    "gloria": ("GlórIA (byte-level BPE)", "rvlopes/GlorIA-1.3B"),
-    "mgpt": ("mGPT (byte-level BPE)", "ai-forever/mGPT"),
+    "gloria": ("GlórIA (byte-level BPE)", "rvlopes/GlorIA-1.3B"),     # confira o repo
+    "mgpt": ("mGPT (byte-level BPE)", "ai-forever/mGPT"),             # confira o repo
     "sabia": ("Sabiá-7B (LLaMA BPE)", "maritaca-ai/sabia-7b"),
     "manaca": ("Manacá-1B (SentencePiece unigram 64k)", "AIInstituteLNCC/manaca-1b-base"),
 }

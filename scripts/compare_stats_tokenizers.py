@@ -55,15 +55,28 @@ def load_samples(paths):
 # --------------------------------------------------------------------------
 # Alinhamento das peças ao texto original
 # --------------------------------------------------------------------------
-def align_starts(text, pieces):
-    """Devolve (offsets de início de cada peça alinhada, nº de peças ignoradas).
+RESYNC_WINDOW = 8   # caracteres à frente em que se procura uma peça que não casou na posição
+
+
+def align_starts(text, pieces, window=RESYNC_WINDOW):
+    """Alinha as peças ao texto original.
+
+    Devolve (offsets de início de cada peça alinhada, contadores, exemplos), com
+    contadores = {"skipped", "dup", "resync"}.
 
     Remove marcadores de espaço (▁, espaço inicial) e de continuação (##) e
-    procura a peça no texto a partir da posição atual, pulando espaços.
-    Peças que não casam (ex.: bytes parciais de UTF-8 decodificados
-    isoladamente) são ignoradas sem desalinhar as seguintes.
+    procura a peça no texto a partir da posição atual, pulando espaços. Se não
+    casa ali, há três casos:
+      * dup:    a peça repete o texto que acabou de ser consumido (bytes de um mesmo
+                caractere multibyte que receberam o mesmo offset). Benigno: não é
+                início de nada e não conta como erro;
+      * resync: a peça foi achada poucos caracteres à frente (as peças anteriores
+                eram ilegíveis, ex.: bytes parciais de UTF-8 que viram '�'). Salta
+                para lá em vez de desalinhar todo o resto da amostra;
+      * skipped: não achada. Só estas contam como falha de alinhamento.
     """
-    starts, skipped, pos = [], 0, 0
+    starts, examples, pos = [], [], 0
+    cnt = {"skipped": 0, "dup": 0, "resync": 0}
     for p in pieces:
         q = p.replace("▁", " ").strip()
         if q.startswith("##"):
@@ -76,9 +89,19 @@ def align_starts(text, pieces):
         if text.startswith(q, j):
             starts.append(j)
             pos = j + len(q)
+        elif pos >= len(q) and text[pos - len(q):pos] == q:
+            cnt["dup"] += 1
         else:
-            skipped += 1
-    return starts, skipped
+            k = text.find(q, j, j + len(q) + window)
+            if k != -1:
+                starts.append(k)
+                pos = k + len(q)
+                cnt["resync"] += 1
+            else:
+                cnt["skipped"] += 1
+                if len(examples) < 5:
+                    examples.append((p, text[max(0, j - 10):j] + "⟦" + text[j:j + 12] + "⟧"))
+    return starts, cnt, examples
 
 
 def analyze_sample(sample, names_filter):
@@ -97,7 +120,7 @@ def analyze_sample(sample, names_filter):
         name = r["tokenizer"]
         if name in names_filter:
             continue
-        starts, skipped = align_starts(text, r["pieces"])
+        starts, cnt, examples = align_starts(text, r["pieces"])
         cuts = {comp[s] for s in starts if comp[s] > 0}
         full = sorted(cuts | word_cuts)
         edges = [0] + full + [n]
@@ -106,7 +129,8 @@ def analyze_sample(sample, names_filter):
             "intra_cuts": cuts & cand_intra,
             "spans": spans,
             "n_tokens": r["n_tokens"],
-            "skipped": skipped,
+            "skipped": cnt["skipped"], "dup": cnt["dup"], "resync": cnt["resync"],
+            "examples": examples,
         }
     return out
 
@@ -133,14 +157,21 @@ def aggregate(samples, exclude):
     both = np.zeros((k, k)); a_only = np.zeros((k, k))
     b_only = np.zeros((k, k)); neither = np.zeros((k, k))
     tokens = np.zeros(k); skipped = np.zeros(k)
+    dup = np.zeros(k); resync = np.zeros(k)
     words = np.zeros(k); chars = np.zeros(k); n_samp = np.zeros(k, dtype=int)
+    examples = {nm: [] for nm in names}
 
-    for a in analyzed:
+    for si, a in enumerate(analyzed):
         cand = a["intra"]
         for nm, t in a["tok"].items():
             i = idx[nm]
             tokens[i] += t["n_tokens"]
             skipped[i] += t["skipped"]
+            dup[i] += t["dup"]
+            resync[i] += t["resync"]
+            for ex in t["examples"]:
+                if len(examples[nm]) < 8:
+                    examples[nm].append((si,) + ex)
             words[i] += a["words"]
             chars[i] += a["chars"]
             n_samp[i] += 1
@@ -177,7 +208,8 @@ def aggregate(samples, exclude):
         "names": names, "jaccard": jac, "span": span_jac, "kappa": kappa,
         "tokens_per_word": safe_div(tokens, words, np.nan),
         "chars_per_token": safe_div(chars, tokens, np.nan),
-        "skipped": skipped, "n_samples": len(analyzed), "n_samples_tok": n_samp,
+        "skipped": skipped, "dup": dup, "resync": resync, "examples": examples,
+        "n_samples": len(analyzed), "n_samples_tok": n_samp,
     }
 
 
@@ -213,6 +245,8 @@ def main():
     ap.add_argument("-o", "--output", help="salva a figura (png/pdf/svg)")
     ap.add_argument("--exclude", nargs="*", default=[],
                     help="tokenizadores a ignorar (ex.: bytes)")
+    ap.add_argument("--show-skipped", type=int, default=0, metavar="K",
+                    help="mostra até K exemplos de peças ignoradas por tokenizador (diagnóstico)")
     args = ap.parse_args()
 
     samples = load_samples(args.json_paths)
@@ -221,11 +255,21 @@ def main():
 
     print(f"{st['n_samples']} amostra(s), tokenizadores: {', '.join(names)}")
     print("\nResumo por tokenizador")
-    print(f"{'tokenizador':<20}{'amostras':>10}{'tokens/palavra':>16}"
-          f"{'chars/token':>14}{'peças ignoradas':>18}")
+    print(f"{'tokenizador':<20}{'amostras':>10}{'tokens/palavra':>16}{'chars/token':>14}"
+          f"{'ignoradas':>11}{'resync':>8}{'dup':>6}")
     for i, n in enumerate(names):
         print(f"{n:<20}{st['n_samples_tok'][i]:>10}{st['tokens_per_word'][i]:>16.2f}"
-              f"{st['chars_per_token'][i]:>14.2f}{int(st['skipped'][i]):>18}")
+              f"{st['chars_per_token'][i]:>14.2f}{int(st['skipped'][i]):>11}"
+              f"{int(st['resync'][i]):>8}{int(st['dup'][i]):>6}")
+    print("  ignoradas = peças que não casaram com o texto (falha de alinhamento: seus cortes se perdem);"
+          "\n  resync = achadas poucos caracteres à frente; dup = repetem o caractere anterior (benigno)")
+
+    if args.show_skipped:
+        for i, n in enumerate(names):
+            if st["skipped"][i] and st["examples"][n]:
+                print(f"\nExemplos de peças ignoradas em {n} (⟦ ⟧ = onde o alinhamento esperava a peça):")
+                for si, piece, ctx in st["examples"][n][:args.show_skipped]:
+                    print(f"  amostra {si}: peça {piece!r}  contexto …{ctx}…")
 
     print_matrix("Jaccard dos cortes dentro de palavras", names, st["jaccard"])
     print_matrix("Kappa de Cohen (cortes dentro de palavras)", names, st["kappa"])
