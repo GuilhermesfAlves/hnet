@@ -224,11 +224,43 @@ def print_matrix(title, names, m):
         print(f"{n:<{w}}" + "".join(f"{m[i, j]:>{w}.3f}" for j in range(len(names))))
 
 
-def heatmap(ax, m, names, title):
+ACCENT = "#d9480f"    # destaque (validado contra o azul com validate_palette.js)
+BASE = "#4c8bf5"      # demais tokenizadores
+
+
+def is_highlight(name, patterns):
+    """Destacado se o nome é igual a um padrão ou começa com ele (ex.: 'hnet' -> hnet_*)."""
+    return any(name == p or name.startswith(p) for p in patterns)
+
+
+def reorder(st, order):
+    """Reordena nomes e todas as matrizes/vetores de st segundo `order` (lista de índices)."""
+    o = np.array(order)
+    new = dict(st)
+    new["names"] = [st["names"][i] for i in order]
+    for key in ("jaccard", "span", "kappa"):
+        new[key] = st[key][np.ix_(o, o)]
+    for key in ("tokens_per_word", "chars_per_token", "skipped", "dup", "resync", "n_samples_tok"):
+        new[key] = st[key][o]
+    return new
+
+
+def heatmap(ax, m, names, title, hl=()):
+    """hl = índices (contíguos, no fim) dos tokenizadores destacados."""
     im = ax.imshow(m, vmin=0, vmax=1, cmap="viridis")
     ax.set_xticks(range(len(names)), names, rotation=45, ha="right")
     ax.set_yticks(range(len(names)), names)
     ax.set_title(title, fontsize=11, fontweight="bold")
+    if len(hl):
+        k, h0, h = len(names), min(hl), len(hl)
+        for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+            if lbl.get_text() in {names[i] for i in hl}:
+                lbl.set_fontweight("bold")           # texto segue neutro; destaque = peso + contorno
+        # contorno nas linhas e colunas dos destacados: anel branco por baixo + traço de destaque
+        for xy, w, hh in (((-0.5, h0 - 0.5), k, h), ((h0 - 0.5, -0.5), h, k)):
+            for color, lw in (("white", 4.0), (ACCENT, 2.0)):
+                ax.add_patch(plt.Rectangle(xy, w, hh, fill=False, edgecolor=color,
+                                           linewidth=lw, clip_on=False, zorder=5))
     for i in range(len(names)):
         for j in range(len(names)):
             v = m[i, j]
@@ -247,11 +279,20 @@ def main():
                     help="tokenizadores a ignorar (ex.: bytes)")
     ap.add_argument("--show-skipped", type=int, default=0, metavar="K",
                     help="mostra até K exemplos de peças ignoradas por tokenizador (diagnóstico)")
+    ap.add_argument("--highlight", default="hnet",
+                    help="tokenizadores a destacar na figura, separados por vírgula; vale o nome "
+                         "exato ou o prefixo (padrão: 'hnet' = todos os hnet_*). "
+                         "Passe '' para não destacar nada.")
     args = ap.parse_args()
 
     samples = load_samples(args.json_paths)
     st = aggregate(samples, args.exclude)
+    patterns = [p.strip() for p in args.highlight.split(",") if p.strip()]
+    flags = [is_highlight(n, patterns) for n in st["names"]]
+    # destacados agrupados no fim, mantendo a ordem relativa, para formarem um bloco contíguo
+    st = reorder(st, [i for i, f in enumerate(flags) if not f] + [i for i, f in enumerate(flags) if f])
     names = st["names"]
+    hl = [i for i, n in enumerate(names) if is_highlight(n, patterns)]
 
     print(f"{st['n_samples']} amostra(s), tokenizadores: {', '.join(names)}")
     print("\nResumo por tokenizador")
@@ -275,23 +316,33 @@ def main():
     print_matrix("Kappa de Cohen (cortes dentro de palavras)", names, st["kappa"])
     print_matrix("Jaccard de spans (tokens idênticos)", names, st["span"])
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-    heatmap(axes[0, 0], st["jaccard"], names, "Jaccard — cortes dentro de palavras")
-    im = heatmap(axes[0, 1], st["kappa"], names, "Kappa de Cohen — cortes dentro de palavras")
-    heatmap(axes[1, 0], st["span"], names, "Jaccard — tokens idênticos (span)")
+    # layout automático: rótulos longos/rotacionados não invadem o painel vizinho nem o título
+    fig, axes = plt.subplots(2, 2, figsize=(16, 15), layout="constrained")
+    heatmap(axes[0, 0], st["jaccard"], names, "Jaccard — cortes dentro de palavras", hl)
+    im = heatmap(axes[0, 1], st["kappa"], names, "Kappa de Cohen — cortes dentro de palavras", hl)
+    heatmap(axes[1, 0], st["span"], names, "Jaccard — tokens idênticos (span)", hl)
     fig.colorbar(im, ax=axes[:2, :].ravel().tolist(), shrink=0.6, label="similaridade")
 
     ax = axes[1, 1]
     x = np.arange(len(names))
-    ax.bar(x, st["tokens_per_word"], color="#4c8bf5")
+    ax.bar(x, st["tokens_per_word"], color=[ACCENT if i in hl else BASE for i in range(len(names))])
     ax.set_xticks(x, names, rotation=45, ha="right")
+    for lbl in ax.get_xticklabels():
+        if lbl.get_text() in {names[i] for i in hl}:
+            lbl.set_fontweight("bold")
+    if hl:   # legenda sempre presente com 2 grupos: a cor não é a única pista (rótulos em negrito)
+        from matplotlib.patches import Patch
+        ax.legend(handles=[Patch(color=ACCENT, label="destacados"), Patch(color=BASE, label="demais")],
+                  frameon=False, loc="upper left")
     ax.set_ylabel("tokens por palavra (fertilidade)")
     ax.set_title("Fertilidade", fontsize=11, fontweight="bold")
     for xi, v in zip(x, st["tokens_per_word"]):
         ax.text(xi, v, f"{v:.2f}", ha="center", va="bottom", fontsize=8)
 
-    fig.suptitle(f"Similaridade entre tokenizações ({st['n_samples']} amostra(s))",
-                 fontsize=13)
+    title = f"Similaridade entre tokenizações ({st['n_samples']} amostra(s))"
+    if hl:
+        title += "\ncontorno laranja e negrito = destacados (agrupados no fim): " + ", ".join(names[i] for i in hl)
+    fig.suptitle(title, fontsize=13)
 
     if args.output:
         fig.savefig(args.output, dpi=150, bbox_inches="tight")
