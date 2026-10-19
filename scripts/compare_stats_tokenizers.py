@@ -58,7 +58,7 @@ def load_samples(paths):
 RESYNC_WINDOW = 8   # caracteres à frente em que se procura uma peça que não casou na posição
 
 
-def align_starts(text, pieces, window=RESYNC_WINDOW):
+def align_starts(text, pieces, window=RESYNC_WINDOW, raws=None):
     """Alinha as peças ao texto original.
 
     Devolve (offsets de início de cada peça alinhada, contadores, exemplos), com
@@ -77,7 +77,13 @@ def align_starts(text, pieces, window=RESYNC_WINDOW):
     """
     starts, examples, pos = [], [], 0
     cnt = {"skipped": 0, "dup": 0, "resync": 0}
-    for p in pieces:
+    use_raw = raws is not None and len(raws) == len(pieces)
+    for pi, p in enumerate(pieces):
+        # Token "▁" sozinho = só o marcador de espaço. O tokenizador rápido do HF dá a ele o
+        # offset da 1ª letra da palavra seguinte (ex.: "▁" -> "R" e logo depois "RJ"), o que
+        # sobrepõe o token seguinte. Não carrega texto próprio: ignora.
+        if use_raw and raws[pi] and set(raws[pi]) == {"▁"}:
+            continue
         q = p.replace("▁", " ").strip()
         if q.startswith("##"):
             q = q[2:]
@@ -120,7 +126,7 @@ def analyze_sample(sample, names_filter):
         name = r["tokenizer"]
         if name in names_filter:
             continue
-        starts, cnt, examples = align_starts(text, r["pieces"])
+        starts, cnt, examples = align_starts(text, r["pieces"], raws=r.get("raw"))
         cuts = {comp[s] for s in starts if comp[s] > 0}
         full = sorted(cuts | word_cuts)
         edges = [0] + full + [n]

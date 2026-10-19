@@ -147,6 +147,10 @@ def _hf_offsets(name: str, text: str):
     raw = tok.convert_ids_to_tokens(ids)
     # pedaços do texto original (via offsets) — legíveis, sem Ġ / ## / ▁
     pieces = [text[a:b] for a, b in enc["offset_mapping"]]
+    # Token "▁" sozinho = só o marcador de espaço (SentencePiece/Llama). O tokenizador rápido
+    # dá a ele o offset da 1ª letra da palavra seguinte (ex.: "▁" -> "R" e depois "RJ"),
+    # duplicando texto. Ele não tem texto próprio: peça vazia ('∅'); n_tokens segue o real.
+    pieces = ["" if r and set(r) == {"▁"} else p for p, r in zip(pieces, raw)]
     return pieces, raw, ids, tok.vocab_size
 
 
