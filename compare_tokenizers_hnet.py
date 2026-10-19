@@ -27,6 +27,9 @@ Exemplos:
   python compare_tokenizers.py --dataset-name org/ds --split validation --text-column content \
       --seed 7 --max-chars 400 --tokenizers bpe,wordpiece,spacy,bytes
   python compare_tokenizers.py ... --json-out amostra.json     # salva texto + tokens
+  python compare_tokenizers.py ... --n-samples 50 --json-out amostras.json
+      # 50 textos diferentes, cada um tokenizado por TODOS os tokenizadores; o JSON vira uma
+      # lista (aceita direto pelo script de análise estatística) e há tabela agregada no fim
   python compare_tokenizers.py --dataset-name uonlp/CulturaX --config-name pt \
       --tokenizers bpe,hnet_1stage_L,hnet_2stage_L,hnet_2stage_L_s0,hnet_1stage_Llama \
       --hnet-1stage-L-config configs/hnet_1stage_L.json --hnet-1stage-L-ckpt ckpts/1stage_L.pt \
@@ -55,7 +58,8 @@ SEP = "│"
 # --------------------------------------------------------------------------- #
 # Amostra aleatória do dataset
 # --------------------------------------------------------------------------- #
-def sample_text(args) -> tuple[str, dict]:
+def sample_texts(args) -> list[tuple[str, dict]]:
+    """Sorteia até args.n_samples textos DIFERENTES (um por documento) do dataset."""
     from datasets import load_dataset
 
     ds = load_dataset(
@@ -73,26 +77,37 @@ def sample_text(args) -> tuple[str, dict]:
         "seed": args.seed
     }
 
+    found: list[tuple[str, dict]] = []
+
     if args.streaming:
-        # embaralha por buffer (determinístico com a seed) e pega o 1º texto longo o bastante
+        # embaralha por buffer (determinístico com a seed) e pega os N primeiros textos
+        # longos o bastante (cada um vem de um documento diferente)
         ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
         for i, ex in enumerate(islice(ds, args.max_scan)):
             txt = ex.get(args.text_column)
             if isinstance(txt, str) and len(txt.strip()) >= args.min_chars:
-                meta["stream_pos"] = i
-                return txt, meta
+                found.append((txt, {**meta, "stream_pos": i}))
+                if len(found) >= args.n_samples:
+                    break
+    else:
+        rng = random.Random(args.seed)
+        idxs = list(range(len(ds)))
+        rng.shuffle(idxs)
+        for i in idxs[: args.max_scan]:
+            txt = ds[i][args.text_column]
+            if isinstance(txt, str) and len(txt.strip()) >= args.min_chars:
+                found.append((txt, {**meta, "index": i}))
+                if len(found) >= args.n_samples:
+                    break
+
+    if not found:
         raise RuntimeError(
             f"nenhum texto com >= {args.min_chars} chars nos primeiros {args.max_scan} exemplos")
-
-    rng = random.Random(args.seed)
-    idxs = list(range(len(ds)))
-    rng.shuffle(idxs)
-    for i in idxs[: args.max_scan]:
-        txt = ds[i][args.text_column]
-        if isinstance(txt, str) and len(txt.strip()) >= args.min_chars:
-            meta["index"] = i
-            return txt, meta
-    raise RuntimeError(f"nenhum texto com >= {args.min_chars} chars encontrado")
+    if len(found) < args.n_samples:
+        print(f"aviso: só {len(found)} de {args.n_samples} textos válidos em "
+              f"{args.max_scan} exemplos examinados (aumente --max-scan ou reduza --min-chars)",
+              file=sys.stderr)
+    return found
 
 
 def crop(text: str, max_chars: int, rng: random.Random) -> str:
@@ -202,6 +217,7 @@ HNET_MODELS = {
 }
 
 _STARTS_CACHE: dict = {}   # (chave, texto) -> posições de início de chunk por estágio
+_MODEL_CACHE: dict = {}    # chave -> (modelo, device), já com checkpoint carregado
 
 
 def _hnet_load(key: str, args):
@@ -272,7 +288,10 @@ def hnet_stage_starts(key: str, text: str, args):
 
     import torch
 
-    model, device = _hnet_load(key, args)
+    # com vários textos o checkpoint é carregado uma vez só e reaproveitado
+    if key not in _MODEL_CACHE:
+        _MODEL_CACHE[key] = _hnet_load(key, args)
+    model, device = _MODEL_CACHE[key]
     ids = list(text.encode("utf-8"))
     offset = 0
     if args.hnet_bos:
@@ -283,12 +302,18 @@ def hnet_stage_starts(key: str, text: str, args):
     with torch.no_grad():
         output = model(input_ids)
 
-    masks = [bp.boundary_mask[0].bool().cpu().tolist() for bp in output.bpred_output]
+    # batch = 1, então boundary_mask vira uma lista de bool com um item por posição,
+    # seja ele (1, L) ou já "achatado" (L,) (formato packed/varlen)
+    masks = [bp.boundary_mask.reshape(-1).bool().cpu().tolist()
+             for bp in output.bpred_output]
     starts = compose_stage_starts(masks, len(ids), offset)
 
-    del model, output
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
+    del output
+    if not args.hnet_keep_models:       # libera a GPU entre usos (recarrega a cada texto)
+        _MODEL_CACHE.pop(key, None)
+        del model
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
     _STARTS_CACHE[cache_key] = starts
     return starts
 
@@ -371,6 +396,9 @@ def parse_args():
     p.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--trust-remote-code", action="store_true", default=False)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--n-samples", type=int, default=1,
+                   help="nº de entradas (textos de documentos diferentes); cada uma é "
+                        "tokenizada por todos os tokenizadores")
     p.add_argument("--shuffle-buffer", type=int, default=1000)
     p.add_argument("--max-scan", type=int, default=2000,
                    help="máximo de exemplos examinados até achar um texto válido")
@@ -402,6 +430,9 @@ def parse_args():
     p.add_argument("--hnet-bos", action=argparse.BooleanOptionalAction, default=True,
                    help="prefixa o token BOS aos bytes (convenção do H-Net original)")
     p.add_argument("--hnet-bos-id", type=int, default=254)
+    p.add_argument("--hnet-keep-models", action=argparse.BooleanOptionalAction, default=True,
+                   help="mantém os H-Nets carregados entre textos (--no-hnet-keep-models "
+                        "libera a GPU após cada uso, mas recarrega o checkpoint a cada texto)")
 
     p.add_argument("--max-show", type=int, default=120, help="máx. de tokens exibidos")
     p.add_argument("--show-ids", action="store_true", default=False)
@@ -419,37 +450,65 @@ def main() -> int:
         print(f"tokenizadores desconhecidos: {bad}; válidos: {list(TOKENIZERS)}")
         return 2
 
-    full, meta = sample_text(args)
-    text = crop(full, args.max_chars, random.Random(args.seed))
-    meta.update(n_chars=len(text), n_bytes=len(text.encode("utf-8")))
+    samples = sample_texts(args)
+    n_total = len(samples)
+    rng = random.Random(args.seed)      # recortes sequenciais; a amostra 0 = comportamento antigo
 
     print(f"Dataset: {args.dataset_name}"
-          f"{'/' + args.config_name if args.config_name else ''} [{args.split}] | seed={args.seed}")
-    print(f"Texto ({len(text)} chars, {meta['n_bytes']} bytes):\n")
-    print(text)
-    print("\n(legenda: '·' = espaço, '│' = fronteira entre tokens, '∅' = token vazio)")
+          f"{'/' + args.config_name if args.config_name else ''} [{args.split}] | "
+          f"seed={args.seed} | {n_total} amostra(s)")
+    print("(legenda: '·' = espaço, '│' = fronteira entre tokens, '∅' = token vazio)")
 
-    results = []
-    for k in keys:
-        label, fn = TOKENIZERS[k]
-        try:
-            results.append(show(k, label, text, fn(text, args), args))
-        except ImportError as e:
-            print(f"\n[{k}] ignorado — dependência ausente: {e}")
-        except Exception as e:  # download/modelo indisponível etc.
-            print(f"\n[{k}] erro: {type(e).__name__}: {e}")
+    # acumuladores para a tabela agregada: tokenizador -> [tokens, chars, bytes, nº amostras]
+    totals: dict[str, list[int]] = {}
+    all_samples = []
 
-    if results:
-        print("\n" + "=" * 100)
-        print(f"{'tokenizador':<20}{'tokens':>8}{'chars/tok':>12}{'bytes/tok':>12}")
-        for r in sorted(results, key=lambda r: r["n_tokens"]):
-            print(f"{r['tokenizer']:<20}{r['n_tokens']:>8}"
-                  f"{r['chars_per_token']:>12.2f}{r['bytes_per_token']:>12.2f}")
+    for si, (full, meta) in enumerate(samples):
+        text = crop(full, args.max_chars, rng)
+        n_bytes = len(text.encode("utf-8"))
+        meta.update(sample_index=si, n_chars=len(text), n_bytes=n_bytes)
+
+        print("\n" + "#" * 100)
+        print(f"AMOSTRA {si + 1}/{n_total} | {len(text)} chars, {n_bytes} bytes\n")
+        print(text)
+
+        results = []
+        for k in keys:
+            label, fn = TOKENIZERS[k]
+            try:
+                r = show(k, label, text, fn(text, args), args)
+            except ImportError as e:
+                print(f"\n[{k}] ignorado — dependência ausente: {e}")
+                continue
+            except Exception as e:  # download/modelo indisponível etc.
+                print(f"\n[{k}] erro: {type(e).__name__}: {e}")
+                continue
+            results.append(r)
+            t = totals.setdefault(k, [0, 0, 0, 0])
+            t[0] += r["n_tokens"]; t[1] += len(text); t[2] += n_bytes; t[3] += 1
+
+        if results:
+            print("\n" + "=" * 100)
+            print(f"amostra {si + 1}/{n_total}")
+            print(f"{'tokenizador':<20}{'tokens':>8}{'chars/tok':>12}{'bytes/tok':>12}")
+            for r in sorted(results, key=lambda r: r["n_tokens"]):
+                print(f"{r['tokenizer']:<20}{r['n_tokens']:>8}"
+                      f"{r['chars_per_token']:>12.2f}{r['bytes_per_token']:>12.2f}")
+
+        all_samples.append({"meta": meta, "text": text, "results": results})
+
+    if n_total > 1 and totals:
+        print("\n" + "#" * 100)
+        print(f"AGREGADO ({n_total} amostras; chars/tok e bytes/tok = totais ÷ total de tokens)")
+        print(f"{'tokenizador':<20}{'amostras':>10}{'tokens':>10}{'chars/tok':>12}{'bytes/tok':>12}")
+        for k, (tok, ch, by, cnt) in sorted(totals.items(), key=lambda kv: kv[1][0] / kv[1][3]):
+            print(f"{k:<20}{cnt:>10}{tok:>10}{ch / max(tok, 1):>12.2f}{by / max(tok, 1):>12.2f}")
 
     if args.json_out:
+        # 1 amostra: objeto (formato antigo); N amostras: lista de objetos {meta, text, results}
+        payload = all_samples[0] if n_total == 1 else all_samples
         with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump({"meta": meta, "text": text, "results": results}, f,
-                      ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"\nSalvo em {args.json_out}")
     return 0
 

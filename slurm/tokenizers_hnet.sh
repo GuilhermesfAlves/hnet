@@ -20,6 +20,7 @@ srun python compare_tokenizers_hnet.py \
     --hnet-2stage-L-ckpt checkpoints/train_pt/hnet_2stage_L/final.pt \
     --hnet-1stage-Llama-config configs/hnet_1stage_Llama.json \
     --hnet-1stage-Llama-ckpt checkpoints/train_pt/hnet_1stage_Llama/final.pt \
+    --n-samples 50 \
     --split "train" \
     --json-out tokenizers_output.json \
     --show-ids \

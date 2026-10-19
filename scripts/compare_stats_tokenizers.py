@@ -12,13 +12,18 @@ espaços). A partir daí são calculadas, para cada par de tokenizadores:
 
 Também mostra fertilidade (tokens por palavra) e caracteres por token.
 
-Uso:
-    python compare_tokenizers.py dados.json
-    python compare_tokenizers.py amostra1.json amostra2.json ... -o saida.png
-    python compare_tokenizers.py dados.jsonl --exclude bytes
+Entradas aceitas (podem ser misturadas na mesma chamada):
+  * um JSON com um objeto {meta, text, results};
+  * um JSON com uma LISTA de objetos (saída do --n-samples);
+  * um .jsonl (um objeto por linha);
+  * vários arquivos de qualquer um dos tipos acima.
+Todas as amostras são agregadas. Se um tokenizador falhou em algumas amostras,
+essas amostras só são ignoradas para ele (e para os pares em que ele entra).
 
-Com vários JSONs (ou um .jsonl) os contadores são agregados, o que dá
-estatísticas bem mais estáveis do que uma única frase.
+Uso:
+    python compare_tokenizers_stats.py dados.json
+    python compare_tokenizers_stats.py amostras.json -o saida.png
+    python compare_tokenizers_stats.py a.json b.json dados.jsonl --exclude bytes
 """
 import argparse
 import json
@@ -41,7 +46,9 @@ def load_samples(paths):
             objs = obj if isinstance(obj, list) else [obj]
         except json.JSONDecodeError:  # tenta JSONL
             objs = [json.loads(line) for line in raw.splitlines() if line.strip()]
-        samples.extend(objs)
+        samples.extend(o for o in objs if isinstance(o, dict) and "text" in o and "results" in o)
+    if not samples:
+        raise SystemExit("nenhuma amostra {text, results} encontrada nos arquivos informados")
     return samples
 
 
@@ -100,7 +107,6 @@ def analyze_sample(sample, names_filter):
             "spans": spans,
             "n_tokens": r["n_tokens"],
             "skipped": skipped,
-            "aligned_chars": sum(len(p.replace('▁', ' ').strip().lstrip('#')) for p in r["pieces"]),
         }
     return out
 
@@ -110,7 +116,15 @@ def analyze_sample(sample, names_filter):
 # --------------------------------------------------------------------------
 def aggregate(samples, exclude):
     analyzed = [analyze_sample(s, set(exclude)) for s in samples]
-    names = list(analyzed[0]["tok"].keys())
+
+    # união ordenada dos tokenizadores (um pode ter falhado em alguma amostra)
+    names = []
+    for a in analyzed:
+        for nm in a["tok"]:
+            if nm not in names:
+                names.append(nm)
+    if not names:
+        raise SystemExit("nenhum tokenizador nas amostras (--exclude removeu todos?)")
     k = len(names)
     idx = {nm: i for i, nm in enumerate(names)}
 
@@ -119,15 +133,18 @@ def aggregate(samples, exclude):
     both = np.zeros((k, k)); a_only = np.zeros((k, k))
     b_only = np.zeros((k, k)); neither = np.zeros((k, k))
     tokens = np.zeros(k); skipped = np.zeros(k)
-    total_words = 0; total_chars = 0
+    words = np.zeros(k); chars = np.zeros(k); n_samp = np.zeros(k, dtype=int)
 
     for a in analyzed:
-        total_words += a["words"]; total_chars += a["chars"]
         cand = a["intra"]
-        for nm in names:
-            tokens[idx[nm]] += a["tok"][nm]["n_tokens"]
-            skipped[idx[nm]] += a["tok"][nm]["skipped"]
-        for x, y in combinations(names, 2):
+        for nm, t in a["tok"].items():
+            i = idx[nm]
+            tokens[i] += t["n_tokens"]
+            skipped[i] += t["skipped"]
+            words[i] += a["words"]
+            chars[i] += a["chars"]
+            n_samp[i] += 1
+        for x, y in combinations([nm for nm in names if nm in a["tok"]], 2):
             i, j = idx[x], idx[y]
             A, B = a["tok"][x]["intra_cuts"], a["tok"][y]["intra_cuts"]
             SA, SB = a["tok"][x]["spans"], a["tok"][y]["spans"]
@@ -135,9 +152,10 @@ def aggregate(samples, exclude):
             nn = len(cand) - nb - na - nbo
             for m, v in ((inter, nb), (union, len(A | B)),
                          (s_inter, len(SA & SB)), (s_union, len(SA | SB)),
-                         (both, nb), (a_only, na), (b_only, nbo), (neither, nn)):
-                m[i, j] += v; m[j, i] += v if m is not a_only and m is not b_only else 0
-            a_only[j, i] += nbo; b_only[j, i] += na  # simetria correta
+                         (both, nb), (neither, nn)):
+                m[i, j] += v; m[j, i] += v
+            a_only[i, j] += na; a_only[j, i] += nbo   # só em A (linha) / só em B (coluna)
+            b_only[i, j] += nbo; b_only[j, i] += na
 
     def safe_div(num, den, default=1.0):
         return np.where(den > 0, num / np.where(den > 0, den, 1), default)
@@ -157,9 +175,9 @@ def aggregate(samples, exclude):
 
     return {
         "names": names, "jaccard": jac, "span": span_jac, "kappa": kappa,
-        "tokens_per_word": tokens / total_words,
-        "chars_per_token": total_chars / tokens,
-        "skipped": skipped, "n_samples": len(analyzed),
+        "tokens_per_word": safe_div(tokens, words, np.nan),
+        "chars_per_token": safe_div(chars, tokens, np.nan),
+        "skipped": skipped, "n_samples": len(analyzed), "n_samples_tok": n_samp,
     }
 
 
@@ -203,9 +221,10 @@ def main():
 
     print(f"{st['n_samples']} amostra(s), tokenizadores: {', '.join(names)}")
     print("\nResumo por tokenizador")
-    print(f"{'tokenizador':<15}{'tokens/palavra':>16}{'chars/token':>14}{'peças ignoradas':>18}")
+    print(f"{'tokenizador':<20}{'amostras':>10}{'tokens/palavra':>16}"
+          f"{'chars/token':>14}{'peças ignoradas':>18}")
     for i, n in enumerate(names):
-        print(f"{n:<15}{st['tokens_per_word'][i]:>16.2f}"
+        print(f"{n:<20}{st['n_samples_tok'][i]:>10}{st['tokens_per_word'][i]:>16.2f}"
               f"{st['chars_per_token'][i]:>14.2f}{int(st['skipped'][i]):>18}")
 
     print_matrix("Jaccard dos cortes dentro de palavras", names, st["jaccard"])
