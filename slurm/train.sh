@@ -11,15 +11,21 @@
 #SBATCH -e ./output_%j.err     # Arquivo de erro (adiciona job id %j)
 
 hnet_names=("hnet_2stage_L")
+load_balancing_n=("6" "3,3" "6") 
+lr_multipliers=("2.627,0.876" "2.627,1.517,0.715" "3.715,0.876")
 #batch_sizes=(12 10 6)
 batch_sizes=(10)
 #sequence_lengths=(768 768 512)
 sequence_lengths=(768)
+max_bytes=$((5 * 1024 * 1024 * 1024)) # 5GB
+
 for i in "${!hnet_names[@]}";do
 	hnet="${hnet_names[$i]}"
 	batch="${batch_sizes[$i]}"
 	seq_len="${sequence_lengths[$i]}"
-
+	load_balancing="${load_balancing_n[$i]}"
+	lr_multiplier="${lr_multipliers[$i]}"
+	
 	echo "$hnet $batch $seq_len"
 	mkdir -p gpu
 	nvidia-smi --query-gpu=timestamp,index,name,memory.used,memory.total,utilization.gpu \
@@ -34,8 +40,13 @@ for i in "${!hnet_names[@]}";do
 	    --text-column text \
 		--seq-len $seq_len \
 		--batch-size $batch \
+		--load-balancing-n $load_balancing \
+		--lr-multiplier $lr_multiplier \
+		--lr-schedule wsd \
+		--warmup-frac 0.1 \
+		--decay-frac 0.2 \
 		--no-streaming \
-		--max-tokens 2_000_000_000 \
+		--max-tokens $max_bytes \
 		--num-workers 16 \
 		--save-every 1500 \
         --model-config configs/$hnet.json > output/train_output.$hnet.txt

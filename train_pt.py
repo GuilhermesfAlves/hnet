@@ -31,7 +31,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from dotenv import load_dotenv
 
-from hnet.utils.train import load_balancing_loss, group_params
+from hnet.utils.train import group_params
 from hnet.utils.csv_logger import CsvLogger
 from hnet.utils.arch import count_boundary_stages
 from hnet.utils.metrics import (
@@ -105,6 +105,9 @@ def main():
     parser.add_argument("--lr-multiplier",        type=str,   default=None)
     parser.add_argument("--load-balancing-n",     type=str,   default=None)
     parser.add_argument("--load-balancing-weight",type=float, default=0.03)
+    parser.add_argument("--lr-schedule",  type=str,   default="cosine", choices=["cosine", "wsd"])
+    parser.add_argument("--warmup-frac",  type=float, default=0.10)
+    parser.add_argument("--decay-frac",   type=float, default=0.20)
 
     # infra
     parser.add_argument("--num-workers",               type=int, default=2)
@@ -230,7 +233,18 @@ def main():
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=args.ddp_find_unused_parameters)
-        
+
+    def lr_wsd_tokens(step, tokens):
+        """WSD por tokens: warmup (warmup_frac) -> estável -> decaimento (decay_frac)."""
+        progress = min(max(tokens / max(1, args.max_tokens), 0.0), 1.0)
+        if progress < args.warmup_frac:                      # warmup linear
+            return args.lr * progress / args.warmup_frac
+        decay_start = 1.0 - args.decay_frac
+        if progress < decay_start:                           # estável
+            return args.lr
+        t = (progress - decay_start) / args.decay_frac       # 0 -> 1
+        return args.min_lr + (args.lr - args.min_lr) * (1.0 - t)   # decaimento linear
+    
     def lr_at_steps(step, tokens):
         """Schedule por passos (usa --max-steps)."""
         if step < args.warmup_steps:
@@ -303,7 +317,12 @@ def main():
 
     optimizer.zero_grad()
     data_iter = iter(loader)
-    lr_at = lr_at_tokens if use_token_limit else lr_at_steps
+    
+    if args.lr_schedule == "wsd":
+        assert use_token_limit, "WSD exige --max-tokens"
+        lr_at = lr_wsd_tokens
+    else:
+        lr_at = lr_at_tokens if use_token_limit else lr_at_steps
 
     # ── loop principal ───────────────────────────────────────────────────────
     while True:
@@ -339,8 +358,6 @@ def main():
 
             # lb_loss original (fallback para modelos sem boundary_probs_list)
             lb_loss = torch.zeros((), device=device)
-            for bpred, n in zip(output.bpred_output, lb_n):
-                lb_loss = lb_loss + load_balancing_loss(bpred, n)
 
             # ratio_loss (H-Net com dynamic chunking)
             ratio_loss   = torch.zeros((), device=device)
