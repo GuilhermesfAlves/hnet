@@ -66,6 +66,16 @@ def apply_data_cfg(args, data_cfg, world_size, is_main):
             if is_main:
                 print(f"[resume] {attr}: {getattr(args, attr)} -> {data_cfg[key]} (do checkpoint)")
             setattr(args, attr, data_cfg[key])
+    if args.resume_micro_batch is not None:
+        eff = data_cfg["batch_size"] * data_cfg["grad_accum_steps"]
+        mb = args.resume_micro_batch
+        if eff % mb != 0:
+            raise ValueError(f"batch efetivo {eff} não é divisível por {mb}")
+        args.batch_size = mb
+        args.grad_accum_steps = eff // mb
+        if is_main:
+            print(f"[resume] micro-batch={mb}, grad_accum={args.grad_accum_steps} "
+                  f"(efetivo={eff}/rank)")
     # world_size vem do lançamento (torchrun), não dá para sobrescrever
     if data_cfg.get("world_size") not in (None, world_size) and is_main:
         print(f"AVISO: world_size do checkpoint = {data_cfg['world_size']}, atual = {world_size}. "
@@ -121,7 +131,10 @@ def main():
     parser.add_argument("--csv-path",                  type=str, default=None)
     parser.add_argument("--seed",                      type=int, default=0)
     parser.add_argument("--ddp-find-unused-parameters",action="store_true", default=False)
-
+    parser.add_argument("--resume-micro-batch", type=int, default=None,
+        help="Ao dar resume, usa este micro-batch e ajusta grad_accum_steps "
+            "para manter o batch efetivo do checkpoint.")
+    
     # benchmark
     parser.add_argument("--benchmark", action="store_true", default=False)
 
