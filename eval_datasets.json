@@ -1,0 +1,8 @@
+﻿[
+    {
+        "label": "culturax_pt",
+        "dataset_name": "uonlp/CulturaX",
+        "config_name": "pt",
+        "split": "train"
+    }
+]

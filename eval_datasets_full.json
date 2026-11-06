@@ -1,0 +1,36 @@
+﻿[
+    {
+        "label": "culturax_pt",
+        "dataset_name": "uonlp/CulturaX",
+        "config_name": "pt",
+        "split": "train"
+    },
+    {
+        "label": "calame_pt",
+        "dataset_name": "benchmarks_text/calame_pt",
+        "split": "train",
+        "streaming": false,
+        "eval_steps": 200
+    },
+    {
+        "label": "arc_challenge_pt",
+        "dataset_name": "benchmarks_text/arc_challenge_pt",
+        "split": "train",
+        "streaming": false,
+        "eval_steps": 200
+    },
+    {
+        "label": "hellaswag_pt",
+        "dataset_name": "benchmarks_text/hellaswag_pt",
+        "split": "train",
+        "streaming": false,
+        "eval_steps": 200
+    },
+    {
+        "label": "lambada_pt",
+        "dataset_name": "benchmarks_text/lambada_pt",
+        "split": "train",
+        "streaming": false,
+        "eval_steps": 200
+    }
+]
