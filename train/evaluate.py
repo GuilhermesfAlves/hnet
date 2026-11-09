@@ -1,10 +1,8 @@
-
 import torch
 import torch.nn.functional as F
 
 from hnet.models.mixer_seq import find_frozen_external_modules
 from hnet.utils.metrics import HNetMetrics, compute_bpic, compute_compression_ratio, compute_ratio_loss
-from hnet.utils.train import load_balancing_loss
 
 
 @torch.no_grad()
@@ -17,9 +15,7 @@ def evaluate(
     bytes_per_token: float = 1.0,
 ):
     """
-    Validação usando HNetMetrics para acumular:
-      - soma exata de NLL/tokens  -> lm_loss e BPB exatos sobre todo o split
-      - médias por batch          -> lb_loss, ratio_loss, bpic, stage_ratios
+    Validação com a mesma lógica de métricas do train_pt.py.
 
     Retorna: (lm_loss, lb_loss, ratio_loss, bpb, bpic, stage_ratios)
     """
@@ -45,37 +41,31 @@ def evaluate(
         output = model(input_ids)
         logits = output.logits
 
-        # NLL exata (reduction="sum") -> soma-se ao total para BPB exato
+        # NLL exata (reduction="sum") -> BPB exato sobre todo o split
         nll_sum = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]).float(),
             targets.reshape(-1),
             reduction="sum",
         )
 
-        lb_loss = torch.zeros((), device=device)
-        if hasattr(output, "bpred_output") and lb_n:
-            for bpred, n in zip(output.bpred_output, lb_n):
-                lb_loss = lb_loss + load_balancing_loss(bpred, n)
-
         ratio_loss   = torch.zeros((), device=device)
         stage_ratios = {}
         bpic         = 0.0
-        has_hnet = (
-            hasattr(output, "boundary_probs_list") and
-            hasattr(output, "boundary_ind_list")
-        )
 
-        if has_hnet and lb_n:
-            for b_probs, b_inds, N in zip(
-                output.boundary_probs_list, output.boundary_ind_list, lb_n
-            ):
-                ratio_loss = ratio_loss + compute_ratio_loss(b_probs, b_inds, N)
+        if output.bpred_output and lb_n:
+            boundary_ind_list = []
+            for s, (bpred, N) in enumerate(zip(output.bpred_output, lb_n)):
+                boundary_probs = bpred.boundary_prob[..., 1]
+                boundary_ind   = bpred.boundary_mask.float()
+                boundary_ind_list.append(boundary_ind)
 
-            for s, b_ind in enumerate(output.boundary_ind_list):
-                key = f"compression_L{s+1}/L{s}"
-                stage_ratios[key] = compute_compression_ratio(b_ind)
+                ratio_loss = ratio_loss + compute_ratio_loss(boundary_probs, boundary_ind, N)
+                stage_ratios[f"compression_L{s+1}/L{s}"] = compute_compression_ratio(boundary_ind)
 
-            bpic = compute_bpic(L0, output.boundary_ind_list)
+            bpic = compute_bpic(L0, boundary_ind_list)
+
+        # igual ao train_pt.py: lb_loss passa a ser o ratio_loss
+        lb_loss = ratio_loss
 
         val_metrics.update(
             nll_sum_nats=nll_sum.item(),
@@ -86,6 +76,8 @@ def evaluate(
             stage_ratios=stage_ratios,
         )
 
+    # o eval_pt.py chama model.eval() por conta própria; o train_pt.py usa o
+    # modelo em modo treino depois da validação
     model.train()
     for m in frozen_modules:
         m.eval()
