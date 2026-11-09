@@ -203,3 +203,5 @@ output*.err
 *.out
 notes
 output/
+img_*/
+graficos_*/
